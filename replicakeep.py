@@ -95,8 +95,9 @@ SKIP_FIELD_TYPES = ("esriFieldTypeOID", "esriFieldTypeGeometry",
                     "esriFieldTypeXML")
 LOOPBACK = ("127.0.0.1", "::1", "localhost")
 LAYER_RE = re.compile(r"/FeatureServer/[0-9]+/?$", re.I)
-SYNC_RE = re.compile(r"^SYNC_(SEND|RECEIVE_REC|RECEIVE)_([0-9]+)_([0-9]+)$",
-                     re.I)
+# An optional owner prefix, as arcpy ListVersions returns it (OWNER.SYNC_...).
+SYNC_RE = re.compile(r"^(?:[^.\s]+\.)*SYNC_(SEND|RECEIVE_REC|RECEIVE)_"
+                     r"([0-9]+)_([0-9]+)$", re.I)
 EXIT_ON = ("idle", "any", "never")
 
 IDLE = "IDLE"
@@ -263,12 +264,16 @@ def build(versions, replicas, replica_log, as_of=None):
         as_of = cell(versions[0], EXPORTED_AT, "versions", 0, parse_time)
         if as_of is None:
             raise InputError("the versions export has a blank exported_at.")
-    anchors = {}
+    anchors, odd = {}, 0
     for r in versions:
-        m = SYNC_RE.match(clean(r.get("name")))
+        name = clean(r.get("name"))
+        m = SYNC_RE.match(name)
         if m:
-            anchors.setdefault(int(m.group(2)), []).append(
-                clean(r.get("name")))
+            anchors.setdefault(int(m.group(2)), []).append(name)
+        elif "SYNC_" in name.upper():
+            # Looks like an anchor, matches no pattern. Silence here would
+            # call every replica clean.
+            odd += 1
     reps, unread, objectids = [], 0, set()
     for i, r in enumerate(replicas):
         objectid = cell(r, "objectid", "replicas", i, to_int)
@@ -313,7 +318,7 @@ def build(versions, replicas, replica_log, as_of=None):
         raise InputError("the as-of time is earlier than the newest replica "
                          "log row, so an age would be negative.")
     return {"as_of": as_of, "anchors": anchors, "replicas": reps,
-            "unread": unread, "log": log}
+            "unread": unread, "odd": odd, "log": log}
 
 
 def analyse(model, min_idle_days=DEFAULT_MIN_IDLE_DAYS,
@@ -414,7 +419,7 @@ def analyse(model, min_idle_days=DEFAULT_MIN_IDLE_DAYS,
     known = set(r["id"] for r in model["replicas"])
     detached = sorted(i for i in model["anchors"] if i not in known)
     return {"verdicts": verdicts, "edits": edits, "detached": detached,
-            "as_of": as_of, "unread": model["unread"]}
+            "as_of": as_of, "unread": model["unread"], "odd": model["odd"]}
 
 
 def resolve_target(dataset, targets):
@@ -430,13 +435,22 @@ def resolve_target(dataset, targets):
 
 
 def gate(report, exit_on, repaired=()):
-    """The exit code. Exit 2 is decided elsewhere and wins over this."""
+    """The exit code. Exit 2 is decided elsewhere and wins over this.
+
+    Besides replicas, a finding is a version name that looks like an anchor
+    and matches no pattern, and an anchor whose replica item is missing while
+    another item could not be read.
+    """
     found = [v for v in report["verdicts"]
              if v["status"] in (IDLE, COVERED) and v["id"] not in repaired
              or v["status"] in UNJUDGED]
     if exit_on == "never":
         return 0
-    if found or (exit_on == "any" and report["detached"]):
+    # An anchor with no readable item may belong to an item that was not read.
+    # The tool cannot judge it, so it is a finding as an unjudged replica is.
+    unattributed = report["detached"] and report["unread"]
+    if found or unattributed or report["odd"] or (
+            exit_on == "any" and report["detached"]):
         return 1
     return 0
 
@@ -459,15 +473,25 @@ def describe(report, min_idle_days, applied=None, apply=False):
                  "--only; %d item(s) were not a usable GPReplica."
                  % (hidden, report["unread"]))
     if report["detached"]:
-        lines.append("ANCHOR WITHOUT A REPLICA ITEM: replica id(s) %s. No "
-                     "edit helps these. Run compressfloor, which names them."
-                     % ", ".join(str(i) for i in report["detached"]))
+        lines.append("ANCHOR WITHOUT A REPLICA ITEM: replica id(s) %s. %s Run "
+                     "compressfloor, which names them."
+                     % (", ".join(str(i) for i in report["detached"]),
+                        "%d item(s) were not a usable GPReplica and one may "
+                        "own these, so the tool cannot judge them."
+                        % report["unread"] if report["unread"]
+                        else "No edit helps these."))
+    if report["odd"]:
+        lines.append("%d version name(s) hold SYNC_ but match no anchor "
+                     "pattern (SYNC_SEND_, SYNC_RECEIVE_ or SYNC_RECEIVE_REC_ "
+                     "then replica id and generation), so the tool cannot "
+                     "judge them." % report["odd"])
     lines += ["", "PLAN"]
     for n, e in enumerate(report["edits"], 1):
         lines.append("  edit %d of %d for replica %d (covers %s): dataset %s, "
                      "filter %s" % (n, len(report["edits"]), e["replica"],
                                     ", ".join(str(i) for i in e["covers"]),
-                                    e["dataset"], e["query"] or "none"))
+                                    e["dataset"],
+                                    clean(e["query"]) or "none"))
         lines.append("    rewrite one attribute of the lowest OBJECTID that "
                      "satisfies the filter with its own value.")
         lines.append("    target: %s" % (
@@ -494,11 +518,18 @@ def describe(report, min_idle_days, applied=None, apply=False):
                   "checked. Read the lines above.")
     else:
         ending = "Every edit was made and checked."
+    extra = ""
+    if report["detached"] and report["unread"]:
+        extra += "; %d anchor replica id(s) have no readable item" % len(
+            report["detached"])
+    if report["odd"]:
+        extra += "; %d SYNC_ version name(s) match no anchor pattern" % (
+            report["odd"])
     lines.append("VERDICT: %d idle replica(s) at %d day(s) or more, %d "
                  "edit(s) planned; %d more hold anchors that an edit cannot "
-                 "move or that could not be judged. %s" % (
+                 "move or that could not be judged%s. %s" % (
                      idle, min_idle_days, len(report["edits"]), unjudged,
-                     ending))
+                     extra, ending))
     return lines
 
 
@@ -680,6 +711,16 @@ def apply_plan(report, token, max_edits):
         raise ApplyError("no unique --targets row matches the dataset of "
                          "replica(s) %s." % ", ".join(str(i)
                                                       for i in missing))
+    # One layer is one dataset. Two datasets that resolve to it would both
+    # read as repaired after one edit, so the run stops before any request.
+    owner = {}
+    for e in edits:
+        other = owner.setdefault(e["target"], e)
+        if other["dataset"].upper() != e["dataset"].upper():
+            raise ApplyError("replicas %d and %d plan edits on different "
+                             "datasets, but --targets resolves both to one "
+                             "layer. Name each dataset in full."
+                             % (other["replica"], e["replica"]))
     picks = {}
     for e in edits:
         try:
@@ -956,8 +997,12 @@ FEATURE = "esriDTFeatureClass"
 PLANTS = "SYNTHDB.OWNER.PLANTS"
 
 
-def fixture():
-    """Synthetic exports. Item objectids differ from replica ids on purpose."""
+def fixture(detached=False):
+    """Synthetic exports. Item objectids differ from replica ids on purpose.
+
+    detached adds an anchor of replica 77, which no item owns. The fixture
+    holds two unreadable items, so with it every run is a finding.
+    """
     reps = [
         (9001, 101, "alpha_to_web", SERVER_TYPE,
          [(PLANTS, FEATURE, "(KIND=&apos;A&apos;)")]),
@@ -985,7 +1030,8 @@ def fixture():
                          "-1", "sync_item", root="GPSyncReplica")})
     replicas.append({"objectid": 9012, "item_type": "Replica",
                      "definition": definition("-1", "no_id")})
-    names = ["DEFAULT", "ED_WO", "SYNC_SEND_77_1", "SYNC_RECEIVE_REC_101_4"]
+    names = ["DEFAULT", "ED_WO", "SYNC_RECEIVE_REC_101_4"]
+    names += ["SYNC_SEND_77_1"] * detached
     for rid in (101, 102, 103, 104, 105, 106, 107, 108, 109):
         names += ["SYNC_SEND_%d_3" % rid, "SYNC_RECEIVE_%d_3" % rid]
     versions = [{"name": n, "owner": "SDE", "state_id": 1,
@@ -1208,6 +1254,17 @@ def self_test():
             os.environ.update(saved)
         return code, out.getvalue(), err.getvalue()
 
+    def message(fn, exc_type=InputError):
+        """The text of the error fn raises. A missing error gives text that
+        no assertion on a message can match, so it fails instead of
+        vanishing."""
+        text = "no error was raised"
+        try:
+            fn()
+        except exc_type as exc:
+            text = str(exc)
+        return text
+
     print("replicakeep self-test: no database, no real service, no credentials")
     print("-" * 68)
 
@@ -1215,6 +1272,7 @@ def self_test():
     fx = fixture()
     model = build(**fx)
     report = analyse(model)
+    dreport = analyse(build(**fixture(True)))
     by = dict((v["id"], v) for v in report["verdicts"])
     edits = dict((e["replica"], e) for e in report["edits"])
     check(model["as_of"] == AS_OF, "the as-of time is the export's database "
@@ -1251,7 +1309,8 @@ def self_test():
           "is ACTIVE, though the first row is 30 days old  <-- pinned defect")
     check(by[110]["status"] == NO_ANCHOR,
           "a replica that holds no anchor pins nothing and is left alone")
-    check(report["detached"] == [77] and report["unread"] == 2,
+    check(dreport["detached"] == [77] and dreport["unread"] == 2
+          and report["detached"] == [],
           "an anchor with no replica item is reported, and a Sync Replica "
           "item and an item with ID -1 are counted as unread")
     check(len(edits) == 3 and len([v for v in report["verdicts"]
@@ -1302,11 +1361,11 @@ def self_test():
     check(clean("a\nVERDICT: clean") == "a\\nVERDICT: clean",
           "a newline in a name cannot forge a report line  "
           "<-- pinned defect")
-    try:
-        cell({"c": "SECRET-VALUE"}, "c", "replicas", 3, to_int)
-    except InputError as exc:
-        check("SECRET-VALUE" not in str(exc) and "row 4" in str(exc),
-              "a bad cell names the row and never echoes the value")
+    text = message(lambda: cell({"c": "SECRET-VALUE"}, "c", "replicas", 3,
+                                to_int))
+    check("SECRET-VALUE" not in text and "row 4" in text,
+          "a bad cell names the row and never echoes the value  "
+          "<-- pinned defect")
     check(parse_definition("   ") is None, "a blank definition is unread")
     check(parse_definition(definition("x1", "n")) is None,
           "a non-numeric replica ID is unread")
@@ -1490,10 +1549,22 @@ def self_test():
           "a replica whose edit was applied is no longer a finding")
     quiet = analyse(model, only=set([109]))
     check(gate(quiet, "idle") == 0, "nothing idle is exit 0")
-    quiet["detached"] = [77]
+    quiet["detached"], quiet["unread"] = [77], 0
     check((gate(quiet, "idle"), gate(quiet, "any")) == (0, 1),
           "an anchor with no replica is a finding only under --exit-on any")
+    quiet["unread"] = 1
+    check((gate(quiet, "idle"), gate(quiet, "any"), gate(quiet, "never"))
+          == (1, 1, 0), "an anchor with no replica item is a finding when "
+          "another item could not be read, for that item may own it  "
+          "<-- pinned defect")
     quiet["detached"] = []
+    check(gate(quiet, "idle") == 0, "an unread item with no detached anchor "
+          "is no finding")
+    quiet["odd"] = 2
+    check((gate(quiet, "idle"), gate(quiet, "never")) == (1, 0),
+          "a version name that looks like an anchor and matches no pattern "
+          "is a finding  <-- pinned defect")
+    quiet["odd"] = 0
     for status in (IDLE, COVERED, NOT_SYNCING, NO_ACK, NO_DATASET, NO_TYPE,
                    SHORT_LOG):
         quiet["verdicts"][0]["status"] = status
@@ -1512,12 +1583,10 @@ def self_test():
         check(holds_secret(url), "a URL with %s holds a secret" % what)
     check(not holds_secret("https://h/x/FeatureServer/0"),
           "a plain layer URL holds no secret")
-    try:
-        apply_plan(report, "", 3)
-    except ApplyError as exc:
-        check("--max-edits" not in str(exc) and "--targets" in str(exc),
-              "a plan of exactly --max-edits edits is not refused for its "
-              "size  <-- pinned defect")
+    text = message(lambda: apply_plan(report, "", 3), ApplyError)
+    check("--max-edits" not in text and "--targets" in text,
+          "a plan of exactly --max-edits edits is not refused for its "
+          "size  <-- pinned defect")
     lines = describe(report, 6)
     text = "\n".join(lines)
     check(lines[-1].startswith("VERDICT: 4 idle replica(s) at 6 day(s)")
@@ -1525,10 +1594,44 @@ def self_test():
           and "Nothing was written" in lines[-1],
           "the report ends with a VERDICT line that counts the replicas it "
           "could not judge")
+    check("ANCHOR WITHOUT" not in text and "version name(s)" not in text
+          and "no readable item" not in lines[-1],
+          "a clean model prints no detached-anchor or odd-name line")
+    dlines = describe(dreport, 6)
+    dtext = "\n".join(dlines)
+    check("2 item(s) were not a usable GPReplica and one may own these"
+          in dtext and "No edit helps" not in dtext
+          and "1 anchor replica id(s) have no readable item" in dlines[-1],
+          "a detached anchor beside unread items is called unjudged in the "
+          "report and the VERDICT line  <-- pinned defect")
+    nounread = dict(dreport, unread=0)
+    check("No edit helps these" in "\n".join(describe(nounread, 6))
+          and "no readable item" not in describe(nounread, 6)[-1],
+          "a detached anchor with every item read is called beyond an edit")
+    odd = fixture(True)
+    odd["versions"] += [dict(odd["versions"][0], name=n) for n in (
+        "Sde.SYNC_SEND_101_3", "DB.SDE.SYNC_SEND_102_3", "SYNC_SEND_abc",
+        "X_SYNC_SEND_1_1", "my_sync_test")]
+    omodel = build(**odd)
+    oreport = analyse(omodel)
+    otext = describe(oreport, 6)
+    check(omodel["odd"] == 3 and "Sde.SYNC_SEND_101_3" in omodel["anchors"][101]
+          and "DB.SDE.SYNC_SEND_102_3" in omodel["anchors"][102]
+          and oreport["odd"] == 3 and "3 version name(s) hold SYNC_" in
+          "\n".join(otext) and "3 SYNC_ version name(s) match no anchor "
+          "pattern" in otext[-1],
+          "an owner-qualified anchor name is an anchor, and a SYNC_ name that "
+          "fits no pattern is counted and reported  <-- pinned defect")
+    qd = describe(dict(report, edits=[dict(report["edits"][0],
+                                           query="a\nb")]), 6)
+    check("filter a\\nb" in "\n".join(qd)
+          and not any(l.startswith("b") for l in qd),
+          "a newline in a replica filter cannot forge a report line  "
+          "<-- pinned defect")
     check("This is an observation" in text, "the report words the claim as "
           "an observation")
     check("hold no anchor" in text and "ANCHOR WITHOUT A REPLICA ITEM"
-          in text and "compressfloor" in text,
+          in dtext and "compressfloor" in dtext,
           "an anchor with no replica points the reader to compressfloor")
     check("replica 101" in text and "NOT_SYNCING" in text,
           "every shown replica gets one line")
@@ -1600,12 +1703,10 @@ def self_test():
             raises(lambda n=name: read_rows(path(n), "versions"),
                    "%s is refused" % label)
         put("secret.csv", "hunter2-password,exported_at,row_count\n")
-        try:
-            read_rows(path("secret.csv"), "versions")
-        except InputError as exc:
-            check("hunter2" not in str(exc),
-                  "an unknown header is never echoed: a credential file "
-                  "passed by mistake stays private")
+        text = message(lambda: read_rows(path("secret.csv"), "versions"))
+        check("hunter2" not in text and "no error" not in text,
+              "an unknown header is never echoed: a credential file "
+              "passed by mistake stays private  <-- pinned defect")
         raises(lambda: read_rows(path("hdr.csv"), "versions"),
                "an export of the wrong kind is refused by its columns")
 
@@ -1800,6 +1901,18 @@ def self_test():
         check(text.startswith("replicakeep:") and "wrote" in out,
               "the report file holds the report")
 
+        # One short target row that matches two datasets sends both edits to
+        # one layer. Both would read APPLIED, so the run stops before any
+        # request.
+        stub = setup()
+        put("tg2.csv", "dataset,layer_url\nPLANTS,%s\nROADS,%s\n"
+            % ((stub.base + "/arcgis/rest/services/plants/FeatureServer/0",)
+               * 2))
+        code, out, err, text = go(stub)
+        check(code == 2 and not stub.requests and "one layer" in err
+              and "refused before any edit" in text,
+              "two datasets resolved to one layer stop the run before any "
+              "request  <-- pinned defect")
         stub = setup()
         code, out, err, text = go(stub, full=True)
         check(code == 1 and text.count("APPLIED") == 3
@@ -1835,12 +1948,9 @@ def self_test():
               "<-- pinned defect")
 
         # Two edits that pick one row: the stamp of the first write must not
-        # confirm the second. The stub stops stamping after two writes.
+        # confirm the second. The stub stops stamping after one write.
         stub = setup()
-        stub.layer("plants")["freeze_after"] = 2
-        put("tg2.csv", "dataset,layer_url\nOWNER.PLANTS,%s\nROADS,%s\n"
-            % ((stub.base + "/arcgis/rest/services/plants/FeatureServer/0",)
-               * 2))
+        stub.layer("plants")["freeze_after"] = 1
         code, out, err, text = go(stub)
         check(code == 2 and text.count("    APPLIED ") == 2
               and text.count("    FAILED ") == 1 and "did not move" in text
@@ -1997,7 +2107,7 @@ def self_test():
                 ("https://user:QQ-LEAK@h.example/x/FeatureServer/0",
                  "a URL that holds a login")):
             put("tg2.csv", "dataset,layer_url\nPLANTS,%s\nROADS,%s\n"
-                % (url, url))
+                % (url, url.replace("/0", "/1", 1)))
             OPENER.open = lambda *a, **k: (_ for _ in ()).throw(
                 AssertionError("network used"))
             try:
@@ -2010,7 +2120,7 @@ def self_test():
         stub.close()
 
         put("tg2.csv", "dataset,layer_url\nPLANTS,http://127.0.0.1:1/x/"
-            "FeatureServer/0\nROADS,http://127.0.0.1:1/x/FeatureServer/0\n")
+            "FeatureServer/0\nROADS,http://127.0.0.1:1/y/FeatureServer/0\n")
         code, out, err = run(apply_args(), env=secret)
         check(code == 2 and "request failed" in err
               and secret not in out + err,
@@ -2033,7 +2143,7 @@ def self_test():
               "query string or login  <-- pinned defect")
 
         put("tg2.csv", "dataset,layer_url\nPLANTS,https://127.0.0.1:1/x/"
-            "FeatureServer/0\nROADS,https://127.0.0.1:1/x/FeatureServer/0\n")
+            "FeatureServer/0\nROADS,https://127.0.0.1:1/y/FeatureServer/0\n")
         code, out, err = run(apply_args(), env=secret)
         check(code == 2 and "request failed" in err,
               "an https target is accepted and reaches the network layer")

@@ -37,8 +37,10 @@ printed.
 Exit codes: 0 no finding of the --exit-on level, 1 at least one, 2 the tool
 could not do its job (bad input, a refused URL, a failed read or write).
 By default (--exit-on idle) a finding is an idle replica that the run did not
-repair. --exit-on any also counts a replica that holds anchors and does not
-sync, and an anchor with no replica item. --exit-on never keeps exit 2 only.
+repair, and any other replica that holds anchors and that an edit cannot move
+or the tool cannot judge (not syncing, no known generation, nothing to edit).
+--exit-on any also counts an anchor with no replica item. --exit-on never keeps
+exit 2 only.
 """
 
 import argparse
@@ -102,6 +104,9 @@ NO_DATASET = "NO_DATASET"
 CLIENT = "CLIENT"
 NO_ANCHOR = "NO_ANCHOR"
 EXCLUDED = "EXCLUDED"
+# Anchors held, and no edit moves them or the tool could not judge. A clean
+# exit here would be the false green this tool exists to end.
+UNJUDGED = (NOT_SYNCING, NO_ACK, NO_DATASET)
 
 REQUIRED = {
     "versions": ("name",),
@@ -273,6 +278,10 @@ def build(versions, replicas, replica_log, as_of=None):
     if len(set(r["id"] for r in reps)) != len(reps):
         raise InputError("two replica items carry one replica ID. The tool "
                          "cannot tell which one owns the anchors.")
+    if anchors and not reps:
+        raise InputError("anchor versions exist, but no item in the replicas "
+                         "export is a usable GPReplica, so every anchor would "
+                         "read as detached. Check the item type and the XML.")
     log = {}
     for i, r in enumerate(replica_log):
         when = cell(r, "logdate", "replica_log", i, parse_time)
@@ -286,6 +295,13 @@ def build(versions, replicas, replica_log, as_of=None):
              cell(r, "targetgen", "replica_log", i, to_int)))
     for rows in log.values():
         rows.sort()
+    judged = set(r["objectid"] for r in reps
+                 if r["id"] in anchors and r["target_type"] == SERVER_TYPE)
+    if judged and not judged & set(log):
+        raise InputError("the replica_log export holds no row for any replica "
+                         "item that holds anchors. An empty or truncated log, "
+                         "or one keyed by the replica ID instead of the item "
+                         "objectid, would call every replica not syncing.")
     newest = max([row[0] for rows in log.values() for row in rows] or [as_of])
     if as_of < newest:
         raise InputError("the as-of time is earlier than the newest replica "
@@ -298,6 +314,10 @@ def analyse(model, min_idle_days=DEFAULT_MIN_IDLE_DAYS,
             silent_days=DEFAULT_SILENT_DAYS, event=DEFAULT_EVENT, only=None):
     """Verdict per replica, the edit plan and the anchors with no replica."""
     as_of = model["as_of"]
+    unknown = sorted((only or set()) - set(r["id"] for r in model["replicas"]))
+    if unknown:
+        raise InputError("--only names replica id(s) %s, which no replica "
+                         "item carries." % ", ".join(str(i) for i in unknown))
     verdicts, edits, chosen = [], [], {}
     for rep in sorted(model["replicas"], key=lambda r: r["id"]):
         v = {"id": rep["id"], "name": rep["name"], "status": None,
@@ -305,7 +325,8 @@ def analyse(model, min_idle_days=DEFAULT_MIN_IDLE_DAYS,
         verdicts.append(v)
         anchors = model["anchors"].get(rep["id"], [])
         rows = model["log"].get(rep["objectid"], [])
-        good = [r for r in rows if r[1] == event and r[2] == SUCCESS_CODE]
+        ok = [r for r in rows if r[2] == SUCCESS_CODE]
+        good = [r for r in ok if r[1] == event]
         if only is not None and rep["id"] not in only:
             v["status"] = EXCLUDED
         elif not anchors:
@@ -313,12 +334,14 @@ def analyse(model, min_idle_days=DEFAULT_MIN_IDLE_DAYS,
         elif rep["target_type"] != SERVER_TYPE:
             v["status"] = CLIENT
             v["detail"] = "not a server-type replica, so it is never edited"
-        elif not rows or as_of - rows[-1][0] > datetime.timedelta(
+        elif not ok or as_of - ok[-1][0] > datetime.timedelta(
                 days=silent_days):
             v["status"] = NOT_SYNCING
-            v["detail"] = ("holds %d anchor version(s) and logged no event "
-                           "in the last %d day(s). An edit cannot help it. If "
-                           "it is abandoned, compressfloor --unregister-plan "
+            v["detail"] = ("holds %d anchor version(s) and logged no "
+                           "successful event in the last %d day(s). An edit "
+                           "cannot help a replica that does not sync. If it "
+                           "syncs less often, raise --silent-days. If it is "
+                           "abandoned, compressfloor --unregister-plan "
                            "orders its removal."
                            % (len(anchors), silent_days))
         elif not good:
@@ -381,13 +404,12 @@ def resolve_target(dataset, targets):
 
 def gate(report, exit_on, repaired=()):
     """The exit code. Exit 2 is decided elsewhere and wins over this."""
-    idle = [v for v in report["verdicts"]
-            if v["status"] in (IDLE, COVERED) and v["id"] not in repaired]
-    other = [v for v in report["verdicts"]
-             if v["status"] in (NOT_SYNCING, NO_ACK, NO_DATASET)]
+    found = [v for v in report["verdicts"]
+             if v["status"] in (IDLE, COVERED) and v["id"] not in repaired
+             or v["status"] in UNJUDGED]
     if exit_on == "never":
         return 0
-    if idle or (exit_on == "any" and (other or report["detached"])):
+    if found or (exit_on == "any" and report["detached"]):
         return 1
     return 0
 
@@ -432,9 +454,11 @@ def describe(report, min_idle_days, applied=None, apply=False):
     lines.append("")
     idle = len([v for v in report["verdicts"] if v["status"] in (IDLE,
                                                                  COVERED)])
+    unjudged = len([v for v in report["verdicts"] if v["status"] in UNJUDGED])
     lines.append("VERDICT: %d idle replica(s) at %d day(s) or more, %d "
-                 "edit(s) planned. %s" % (
-                     idle, min_idle_days, len(report["edits"]),
+                 "edit(s) planned; %d more hold anchors that an edit cannot "
+                 "move or that could not be judged. %s" % (
+                     idle, min_idle_days, len(report["edits"]), unjudged,
                      "Nothing was written." if not apply
                      else "Every edit was made as listed."
                      if all(a.startswith("APPLIED") for a in applied.values())
@@ -743,8 +767,11 @@ def _parse(argv):
                     help="measure ages from this time instead of the "
                          "exported_at time in the versions export")
     ap.add_argument("--exit-on", dest="exit_on", choices=EXIT_ON,
-                    help="what makes the exit code 1: idle (default), any, "
-                         "or never. A failure is exit 2 either way.")
+                    help="what makes the exit code 1: idle (default: an idle "
+                         "replica not repaired, or one that cannot be judged "
+                         "or moved by an edit), any (also an anchor with no "
+                         "replica item), or never. A failure is exit 2 "
+                         "either way.")
     ap.add_argument("--report", help="write the report to this file")
     ap.add_argument("--apply", action="store_true",
                     help="make the edits, and write --report. Without this "
@@ -790,6 +817,12 @@ def _main(args):
         return fail("--apply needs --report, so the edits leave a record.")
     if args.report and not args.apply:
         return fail("--report is written only with --apply.")
+    # A CRLF or a copied line leaves a newline on the token. http.client would
+    # then raise an error that quotes the whole header.
+    token = os.environ.get(TOKEN_ENV, "").strip()
+    if args.apply and not all(33 <= ord(c) < 127 for c in token):
+        return fail("%s holds a space, a control or a non-ASCII character. "
+                    "Its value is not shown." % TOKEN_ENV)
     limits = {"min_idle_days": DEFAULT_MIN_IDLE_DAYS,
               "silent_days": DEFAULT_SILENT_DAYS,
               "max_edits": DEFAULT_MAX_EDITS}
@@ -827,8 +860,7 @@ def _main(args):
             return fail("could not write the report: %s" % clean(exc))
     try:
         if args.apply:
-            applied, failed = apply_plan(
-                report, os.environ.get(TOKEN_ENV, ""), args.max_edits)
+            applied, failed = apply_plan(report, token, args.max_edits)
             for e in report["edits"]:
                 if applied[e["replica"]].startswith("APPLIED"):
                     repaired.update(e["covers"])
@@ -1004,7 +1036,10 @@ class Stub(object):
                         layer, leaf, params)).encode("utf-8"))
 
         self.server = HTTPServer(("127.0.0.1", 0), Handler)
-        self.thread = threading.Thread(target=self.server.serve_forever)
+        # A short poll interval: shutdown() waits for one, and the self-test
+        # starts and stops about forty stubs.
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       kwargs={"poll_interval": 0.01})
         self.thread.daemon = True
         self.thread.start()
         self.base = "http://127.0.0.1:%d" % self.server.server_address[1]
@@ -1025,7 +1060,8 @@ class Stub(object):
                 rows[u["attributes"]["OBJECTID"]].update(u["attributes"])
                 if layer["tracking"]:
                     self.clock += 1
-                    rows[u["attributes"]["OBJECTID"]]["EDITED"] = self.clock
+                    rows[u["attributes"]["OBJECTID"]]["EDITED"] = (
+                        None if layer["tracking"] == "null" else self.clock)
             return layer["apply"] or {"updateResults": [
                 {"objectId": 1, "success": True}]}
         return layer["info"]
@@ -1034,15 +1070,25 @@ class Stub(object):
         meta = {"capabilities": "Query,Update,Editing",
                 "fields": [
                     {"name": "OBJECTID", "type": "esriFieldTypeOID",
-                     "editable": False},
+                     "editable": True},
                     {"name": "SHAPE", "type": "esriFieldTypeGeometry",
                      "editable": True},
                     {"name": "GLOBALID", "type": "esriFieldTypeGlobalID",
-                     "editable": False},
+                     "editable": True},
                     {"name": "EDITOR", "type": "esriFieldTypeString",
                      "editable": True},
                     {"name": "EDITED", "type": "esriFieldTypeDate",
                      "editable": True},
+                    {"name": "GUIDX", "type": "esriFieldTypeGUID",
+                     "editable": True},
+                    {"name": "BLOBX", "type": "esriFieldTypeBlob",
+                     "editable": True},
+                    {"name": "RASTERX", "type": "esriFieldTypeRaster",
+                     "editable": True},
+                    {"name": "XMLX", "type": "esriFieldTypeXML",
+                     "editable": True},
+                    {"name": "NOEDIT", "type": "esriFieldTypeString",
+                     "editable": False},
                     {"name": "LABEL", "type": "esriFieldTypeString",
                      "editable": True}],
                 "isDataBranchVersioned": False}
@@ -1128,6 +1174,9 @@ def self_test():
           "clock, not the local clock")
     check(by[101]["status"] == IDLE and by[101]["edit"]["covers"] == [101, 102],
           "a replica idle 100 days that still syncs is IDLE")
+    check("holds 3 anchor version(s)" in by[101]["detail"]
+          and "SYNC_RECEIVE_REC_101_4" in model["anchors"][101],
+          "a SYNC_RECEIVE_REC_ version is an anchor of its replica")
     check(by[102]["status"] == COVERED and by[102]["edit"] is edits[101],
           "a replica on the same dataset and filter shares one edit")
     check("100 day(s)" in by[101]["detail"],
@@ -1136,7 +1185,8 @@ def self_test():
     check(by[103]["status"] == IDLE and 103 in edits,
           "the same dataset with another filter gets its own edit  "
           "<-- pinned defect")
-    check(by[104]["status"] == IDLE and "40 day(s)" in by[104]["detail"],
+    check(by[104]["status"] == IDLE and "40 day(s)" in by[104]["detail"]
+          and "generation 6 unchanged" in by[104]["detail"],
           "idle time runs from the LAST change of generation, not the first "
           "row  <-- pinned defect")
     check(edits[104]["dataset"] == "SYNTHDB.OWNER.ROADS",
@@ -1179,6 +1229,10 @@ def self_test():
           "a wider silence limit lets a replica that synced 20 days ago "
           "be planned")
 
+    raises(lambda: analyse(model, only=set([999])),
+           "--only with an id no replica item carries is refused, never an "
+           "all-clear for nothing  <-- pinned defect")
+
     # ---- cells, times, definitions
     check(parse_time("2026-03-31") == datetime.datetime(2026, 3, 31),
           "a bare date is midnight")
@@ -1188,6 +1242,9 @@ def self_test():
     check(parse_time("  ") is None, "a blank time is None")
     raises(lambda: parse_time("03:00:00 PM"),
            "a 12-hour time is refused, never read as 03:00  "
+           "<-- pinned defect", ValueError)
+    raises(lambda: parse_time("2026-03-31 03:00:00 PM"),
+           "a date with a 12-hour time is refused, never read as 03:00  "
            "<-- pinned defect", ValueError)
     raises(lambda: parse_time("2026-13-01"), "month 13 is refused",
            ValueError)
@@ -1206,8 +1263,13 @@ def self_test():
     check(parse_definition("   ") is None, "a blank definition is unread")
     check(parse_definition(definition("x1", "n")) is None,
           "a non-numeric replica ID is unread")
+    check(parse_definition(definition(0, "n"))["id"] == 0
+          and parse_definition(definition(-1, "n")) is None,
+          "replica ID 0 is read and -1 is not")
     check(parse_definition(definition(5, "")) ["name"] == "(unnamed)",
           "a replica with no name is called (unnamed)")
+    check(parse_definition(definition(5, "n", root="GPSyncReplica")) is None,
+          "a Sync Replica root is unread even when it carries a usable ID")
     raises(lambda: parse_definition("<!DOCTYPE a [<!ENTITY b 'c'>]><a/>"),
            "a definition with a DTD is refused  <-- pinned defect")
     raises(lambda: parse_definition("<GPReplica><ID>"),
@@ -1225,7 +1287,7 @@ def self_test():
     raises(lambda: made(versions=[]), "an empty versions export is refused")
     raises(lambda: made(replicas=[]), "an empty replicas export is refused")
     stale = fixture()["versions"]
-    stale[0]["exported_at"] = ago(5)
+    stale[-1]["exported_at"] = ago(5)
     raises(lambda: made(versions=stale),
            "two exported_at times in one export are refused")
     blank = fixture()["versions"]
@@ -1246,9 +1308,83 @@ def self_test():
                                 - datetime.timedelta(days=2))),
            "an as-of time before the newest log row is refused, never a "
            "negative age  <-- pinned defect")
+    check(build(as_of=AS_OF - datetime.timedelta(days=1), **fixture())
+          ["as_of"] == AS_OF - datetime.timedelta(days=1),
+          "an as-of time equal to the newest log row is allowed")
     later = build(as_of=AS_OF + datetime.timedelta(days=1), **fixture())
     check("101 day(s)" in analyse(later)["verdicts"][0]["detail"],
           "an as-of override moves every age")
+    raises(lambda: made(replica_log=[]),
+           "an empty replica log is refused, never read as no replica "
+           "syncing  <-- pinned defect")
+    raises(lambda: made(replica_log=[
+        dict(r, replicaid=r["replicaid"] - 8900)
+        for r in fixture()["replica_log"]]),
+           "a log keyed by replica ID, which joins to no item, is refused  "
+           "<-- pinned defect")
+    raises(lambda: made(replica_log=[r for r in fixture()["replica_log"]
+                                     if r["replicaid"] == 9005]),
+           "a log that holds rows only for a client replica judges no "
+           "server replica and is refused")
+    raises(lambda: made(replicas=[r for r in fixture()["replicas"]
+                                  if r["objectid"] in (9011, 9012)]),
+           "anchors with no readable replica item are refused  "
+           "<-- pinned defect")
+
+    # ---- a replica log cut to other shapes, one replica at a time
+    def lr(oid, days, gen, event=1, code=0):
+        return {"replicaid": oid, "logdate": ago(days), "event": event,
+                "errorcode": code, "targetgen": gen}
+
+    def relog(drop, extra, **limits):
+        f = fixture()
+        f["replica_log"] = [r for r in f["replica_log"]
+                            if r["replicaid"] not in drop] + extra
+        for r in f["replica_log"]:
+            r["row_count"] = len(f["replica_log"])
+        return dict((v["id"], v)
+                    for v in analyse(build(**f), **limits)["verdicts"])
+    failing = relog((9004,), [lr(9004, 90, 5), lr(9004, 40, 6)]
+                    + [lr(9004, d, 6, code=9) for d in (5, 4, 3, 2, 1)])
+    check(failing[104]["status"] == NOT_SYNCING and failing[104]["edit"] is None
+          and "successful" in failing[104]["detail"],
+          "a replica whose recent syncs all fail is NOT_SYNCING, not IDLE, "
+          "and gets no edit  <-- pinned defect")
+    check(relog((9003,), [])[103]["status"] == NOT_SYNCING,
+          "a replica that holds anchors and has no log row is NOT_SYNCING")
+    check(relog((9003,), [lr(9003, 1, 12, code=5)])[103]["status"]
+          == NOT_SYNCING,
+          "a replica whose only log rows are failures is NOT_SYNCING")
+    edge3 = [lr(9003, 100, 12), lr(9003, 3, 12)]
+    check(relog((9003,), edge3)[103]["status"] == IDLE
+          and relog((9003,), edge3, silent_days=2)[103]["status"]
+          == NOT_SYNCING,
+          "a replica whose last good sync was exactly --silent-days ago "
+          "still syncs; one day more and it does not  <-- pinned defect")
+    backwards = fixture()
+    backwards["replica_log"].reverse()
+    check([(v["id"], v["status"]) for v in analyse(build(**backwards))
+           ["verdicts"]] == [(v["id"], v["status"])
+                             for v in report["verdicts"]],
+          "log rows in any order give the same verdicts")
+    swapped = fixture()
+    swapped["replicas"][0]["definition"] = definition(
+        101, "a", datasets=[("DB.OWNER.PONDS", FEATURE, ""),
+                            (PLANTS, FEATURE, "(KIND=&apos;A&apos;)")])
+    swapped["replicas"][1]["definition"] = definition(
+        102, "b", datasets=[(PLANTS, FEATURE, "(KIND=&apos;A&apos;)")])
+    lower = fixture()
+    lower["replicas"][1]["definition"] = definition(
+        102, "b", datasets=[(PLANTS.lower(), FEATURE, "(KIND=&apos;A&apos;)")])
+    check(dict((v["id"], v["status"]) for v in analyse(build(**lower))
+               ["verdicts"])[102] == COVERED,
+          "two replicas whose dataset names differ only in case share one "
+          "edit")
+    sw = analyse(build(**swapped))
+    check([(v["status"], v["edit"]["dataset"]) for v in sw["verdicts"][:2]]
+          == [(IDLE, "DB.OWNER.PONDS"), (IDLE, PLANTS)],
+          "an edit uses the first dataset only, so a replica that lists "
+          "that dataset second is not covered by another's first")
 
     # ---- the other pure functions
     check(parse_ids("101, 102") == set([101, 102]), "replica ids parse")
@@ -1264,6 +1400,10 @@ def self_test():
     check(resolve_target("DB.OWNER.PLANTS", targets) is None,
           "two targets that match one dataset resolve to none, not the "
           "first  <-- pinned defect")
+    check(resolve_target("db.owner.roads", targets[1:2]) == "u2"
+          and resolve_target("db.owner.roads", [dict(
+              targets[1], dataset="ROADS")]) == "u2",
+          "a dataset name matches a target without regard to case")
     check(resolve_target("DB.OWNER.PONDS", targets) is None,
           "a dataset with no target resolves to none")
     check(resolve_target("DB.OWNER.XPLANTS", targets[2:]) is None,
@@ -1271,7 +1411,9 @@ def self_test():
           "<-- pinned defect")
     check((gate(report, "idle"), gate(report, "any"), gate(report, "never"))
           == (1, 1, 0), "gate: idle and any find the plan, never does not")
-    check(gate(report, "idle", repaired=set([101, 102, 103, 104])) == 0,
+    four = analyse(model, only=set([101, 102, 103, 104]))
+    check((gate(four, "idle"), gate(four, "idle", repaired=set(
+        [101, 102, 103, 104]))) == (1, 0),
           "a replica whose edit was applied is no longer a finding")
     quiet = analyse(model, only=set([109]))
     check(gate(quiet, "idle") == 0, "nothing idle is exit 0")
@@ -1279,15 +1421,36 @@ def self_test():
     check((gate(quiet, "idle"), gate(quiet, "any")) == (0, 1),
           "an anchor with no replica is a finding only under --exit-on any")
     quiet["detached"] = []
-    quiet["verdicts"][0]["status"] = NOT_SYNCING
-    check(gate(quiet, "any") == 1,
-          "a replica that holds anchors and does not sync is a finding "
-          "under --exit-on any")
+    for status in (IDLE, COVERED, NOT_SYNCING, NO_ACK, NO_DATASET):
+        quiet["verdicts"][0]["status"] = status
+        check((gate(quiet, "idle"), gate(quiet, "any"), gate(quiet, "never"))
+              == (1, 1, 0),
+              "a %s replica is a finding by default, never a clean exit  "
+              "<-- pinned defect" % status)
+    for status in (ACTIVE, CLIENT, NO_ANCHOR, EXCLUDED):
+        quiet["verdicts"][0]["status"] = status
+        check(gate(quiet, "any") == 0,
+              "a %s replica is no finding" % status)
+    for url, what in (("https://h/x/FeatureServer/0?token=a", "a query"),
+                      ("https://h/x/FeatureServer/0#a", "a fragment"),
+                      ("https://user@h/x/FeatureServer/0", "a user name"),
+                      ("https://:pw@h/x/FeatureServer/0", "a password")):
+        check(holds_secret(url), "a URL with %s holds a secret" % what)
+    check(not holds_secret("https://h/x/FeatureServer/0"),
+          "a plain layer URL holds no secret")
+    try:
+        apply_plan(report, "", 3)
+    except ApplyError as exc:
+        check("--max-edits" not in str(exc) and "--targets" in str(exc),
+              "a plan of exactly --max-edits edits is not refused for its "
+              "size  <-- pinned defect")
     lines = describe(report, 6)
     text = "\n".join(lines)
     check(lines[-1].startswith("VERDICT: 4 idle replica(s) at 6 day(s)")
+          and "3 more hold anchors" in lines[-1]
           and "Nothing was written" in lines[-1],
-          "the report ends with a VERDICT line")
+          "the report ends with a VERDICT line that counts the replicas it "
+          "could not judge")
     check("This is an observation" in text, "the report words the claim as "
           "an observation")
     check("hold no anchor" in text and "ANCHOR WITHOUT A REPLICA ITEM"
@@ -1348,8 +1511,8 @@ def self_test():
                  "a,b,2026-01-01,1\n", "two columns with one name"),
                 ("arr.json", '{"a": 1}', "a JSON object that is not an array"),
                 ("dup.json", '[{"a": 1, "a": 2}]', "a JSON key given twice"),
-                ("mixed.csv", "name,exported_at,row_count\nv,2026-01-01,1\n"
-                 "w,2026-01-01,2\n", "two different row_count values")):
+                ("mixed.csv", "name,exported_at,row_count\nv,2026-01-01,2\n"
+                 "w,2026-01-01,3\n", "two different row_count values")):
             put(name, text)
             raises(lambda n=name: read_rows(path(n), "versions"),
                    "%s is refused" % label)
@@ -1375,8 +1538,12 @@ def self_test():
               "--exit-on never exits 0 on the same findings")
         check(run(argv + ["--only", "109"])[0] == 0,
               "--only 109 plans nothing and exits 0")
-        check(run(argv + ["--min-idle-days", "200"])[0] == 0,
-              "a limit above every idle time exits 0")
+        code, out, err = run(argv + ["--min-idle-days", "200"])
+        check(code == 1 and "VERDICT: 0 idle replica(s)" in out
+              and "2 more hold anchors" in out,
+              "a limit above every idle time leaves no idle replica, but "
+              "the replicas that cannot be judged still make exit 1  "
+              "<-- pinned defect")
         check(run(argv + ["--as-of", "2026-04-01", "--min-idle-days", "0",
                           "--silent-days", "400"])[0] == 1,
               "--as-of is read as a date")
@@ -1390,30 +1557,42 @@ def self_test():
                  "--apply with no --report"),
                 (["--report", path("r.txt")],
                  "--report with no --apply"),
-                (["--as-of", "2026-03-01"], "an --as-of before the log")):
+                (["--as-of", "2026-03-01"], "an --as-of before the log"),
+                (["--only", "999"], "--only with an unknown replica id")):
             code, out, err = run(argv + flags)
             check(code == 2 and err.startswith("error:"),
                   "%s exits 2 on stderr" % label)
         check(not os.path.exists(path("r.txt")),
               "a refused --report was never created")
+        check("--apply needs --targets" in run(argv + ["--apply"])[2]
+              and "--apply needs --report" in run(
+                  argv + ["--targets", path("t.csv"), "--apply"])[2],
+              "--apply names the flag it is missing")
         code, out, err = run(argv[:2])
         check(code == 2 and "--replicas" in err and "--replica-log" in err,
               "a missing export is named")
         code, out, err = run(["--versions", path("nope.csv")] + argv[2:])
         check(code == 2, "an unreadable export exits 2, not 1")
+        code, out, err = run(argv[:5] + [path("hdr.csv")])
+        check(code == 2 and "no row for any replica" in err,
+              "a header-only replica log exits 2, never a clean 0  "
+              "<-- pinned defect")
         code, out, err = run(["--self-test", "--apply"])
         check(code == 2 and "takes no other flag" in err,
               "--self-test refuses every other flag")
-        for abbrev in ("--ap", "--repor", "--replica-l", "--exit", "--vers",
-                       "--min-idle", "--sil"):
+        # Each argv is valid if the prefix were accepted, so only the parser's
+        # allow_abbrev=False can make it exit 2.
+        for abbrev in (["--ap"], ["--repor", "x"], ["--replica-l", "x"],
+                       ["--exit", "any"], ["--vers", "x"],
+                       ["--min-idle", "5"], ["--sil", "5"]):
             with contextlib.redirect_stderr(io.StringIO()):
                 refused = False
                 try:
-                    _parse(argv + [abbrev, "x"])
+                    _parse(abbrev)
                 except SystemExit as exc:
                     refused = exc.code == 2
             check(refused, "the abbreviation %s is refused by the parser  "
-                  "<-- pinned defect" % abbrev)
+                  "<-- pinned defect" % abbrev[0])
         fx2 = fixture()
         fx2["replicas"][0]["definition"] = "<GPReplica><ID>"
         write_csv(path("replicas.csv"), fx2["replicas"])
@@ -1447,6 +1626,12 @@ def self_test():
                   in out and "target: none" in out,
                   "a plan-only run shows the targets it resolved and opens "
                   "no connection")
+            put("tg.json", json.dumps([{
+                "dataset": "PLANTS",
+                "layer_url": "https://h.example/x/FeatureServer/0"}]))
+            code, out, err = run(argv + ["--targets", path("tg.json")])
+            check(code == 1 and "target: https://h.example/x/FeatureServer/0"
+                  in out, "a JSON targets file resolves like a CSV one")
         finally:
             OPENER.open = real_open
 
@@ -1462,13 +1647,16 @@ def self_test():
                 % (plants, roads))
             return stub
 
-        def apply_args(extra=()):
+        def apply_args(extra=(), full=False):
+            # Unless full, only the four idle replicas are in the run, so a
+            # repaired run is exit 0 and not 1 for the three left unjudged.
             return argv + ["--targets", path("tg2.csv"), "--report",
-                           path("rep.txt"), "--apply"] + list(extra)
+                           path("rep.txt"), "--apply"] + (
+                [] if full else ["--only", "101,102,103,104"]) + list(extra)
 
-        def go(stub, extra=(), env=secret):
+        def go(stub, extra=(), env=secret, full=False):
             try:
-                result = run(apply_args(extra), env=env)
+                result = run(apply_args(extra, full), env=env)
                 with open(path("rep.txt"), encoding="utf-8") as handle:
                     text = handle.read()
             finally:
@@ -1513,6 +1701,10 @@ def self_test():
                     if r["path"].endswith("/applyEdits"))
         check(first == 9 and len(sent) == 3,
               "every layer and row is read before the first write")
+        check(all(r["params"].get("rollbackOnFailure") == "true"
+                  for r in sent),
+              "every edit asks the service to roll back on failure  "
+              "<-- pinned defect")
         check(stub.requests[0]["method"] == "GET"
               and not any("KIND" in r["query"] for r in stub.requests),
               "a filter never travels in a URL")
@@ -1521,6 +1713,30 @@ def self_test():
               "the edit is checked by reading the last edit date back")
         check(text.startswith("replicakeep:") and "wrote" in out,
               "the report file holds the report")
+
+        stub = setup()
+        code, out, err, text = go(stub, full=True)
+        check(code == 1 and text.count("APPLIED") == 3
+              and "3 more hold anchors" in text,
+              "a repaired run is still exit 1 while replicas that cannot be "
+              "judged remain  <-- pinned defect")
+
+        for ending in ("\r\n", "\n", "  "):
+            stub = setup()
+            code, out, err, text = go(stub, env=secret + ending)
+            check(code == 0 and all(r["token"] == "Bearer " + secret
+                                    for r in stub.requests),
+                  "a token with %r after it is trimmed, not rejected  "
+                  "<-- pinned defect" % ending)
+        for bad in ("tok QQ-LEAK2", "tok\x01QQ-LEAK2", "t\u00e9k-QQ-LEAK2"):
+            code, out, err = run(argv + [
+                "--targets", path("tg2.csv"), "--report", path("tok.txt"),
+                "--apply"], env=bad)
+            check(code == 2 and "QQ-LEAK2" not in out + err
+                  and TOKEN_ENV in err and not os.path.exists(path("tok.txt")),
+                  "a token with a space, a control or a non-ASCII character "
+                  "is refused before the report is opened, and its text is "
+                  "never echoed  <-- pinned defect")
 
         stub = setup(tracking=False)
         code, out, err, text = go(stub, env=None)
@@ -1537,6 +1753,22 @@ def self_test():
               and text.count("    FAILED ") == 3,
               "a success the last edit date does not confirm is a failure, "
               "and the other edits are still tried  <-- pinned defect")
+
+        stub = setup()
+        stub.layer("plants")["tracking"] = "null"
+        stub.layer("roads")["tracking"] = "null"
+        code, out, err, text = go(stub)
+        check(code == 2 and "did not move" in text
+              and text.count("    FAILED ") == 3,
+              "a last edit date that comes back empty is a failure  "
+              "<-- pinned defect")
+
+        stub = setup()
+        stub.layer("roads")["raw"]["0"] = (
+            200, b'{"error": {"code": 498, "message": "Invalid"}}', [])
+        code, out, err, text = go(stub)
+        check(code == 2 and "code 498" in text and not writes(stub),
+              "the service's own error code is reported")
 
         for label, body in (
                 ("success false", {"updateResults": [{"success": False}]}),
@@ -1566,6 +1798,11 @@ def self_test():
         def lose_field(layer):
             layer["rows"][7].pop("LABEL")
 
+        def lock_label(layer):
+            for field in layer["info"]["fields"]:
+                if field["name"] == "LABEL":
+                    field["editable"] = False
+
         def raw(status, body, headers=()):
             return lambda layer: layer["raw"].update(
                 {"0": (status, body, list(headers))})
@@ -1576,6 +1813,7 @@ def self_test():
             ("a branch versioned layer",
              lambda layer: layer["info"].update(isDataBranchVersioned=True)),
             ("no editable attribute field", drop_editable),
+            ("an attribute field that is not editable", lock_label),
             ("two OID fields", two_oids),
             ("no row that satisfies the filter",
              lambda layer: layer["ids"].update({"1=1": []})),
@@ -1696,15 +1934,17 @@ def self_test():
             "about one")
 
         real_analyse = globals()["analyse"]
-        globals()["analyse"] = lambda *a, **k: 1 / 0
-        try:
-            code, out, err = run(argv)
-        finally:
-            globals()["analyse"] = real_analyse
-        check(code == 2 and "ZeroDivisionError" in err
-              and "not a finding" in err,
-              "an unexpected error exits 2, never the 1 Python would "
-              "give  <-- pinned defect")
+        for boom, name in ((lambda *a, **k: 1 / 0, "ZeroDivisionError"),
+                           (lambda *a, **k: {}["k"], "KeyError"),
+                           (lambda *a, **k: math.exp(1000), "OverflowError")):
+            globals()["analyse"] = boom
+            try:
+                code, out, err = run(argv)
+            finally:
+                globals()["analyse"] = real_analyse
+            check(code == 2 and name in err and "not a finding" in err,
+                  "an unexpected %s exits 2, never the 1 Python would "
+                  "give  <-- pinned defect" % name)
 
         meta = Harness()
         with contextlib.redirect_stdout(io.StringIO()) as sink:

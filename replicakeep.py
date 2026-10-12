@@ -38,7 +38,9 @@ Exit codes: 0 no finding of the --exit-on level, 1 at least one, 2 the tool
 could not do its job (bad input, a refused URL, a failed read or write).
 By default (--exit-on idle) a finding is an idle replica that the run did not
 repair, and any other replica that holds anchors and that an edit cannot move
-or the tool cannot judge (not syncing, no known generation, nothing to edit).
+or the tool cannot judge (not syncing, no known generation, nothing to edit,
+no recognised TargetType, a log too short to show how long a generation stood
+still, or an edit that could not be checked).
 --exit-on any also counts an anchor with no replica item. --exit-on never keeps
 exit 2 only.
 """
@@ -82,7 +84,9 @@ REQUEST_TIMEOUT = 30
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 TOKEN_ENV = "REPLICAKEEP_TOKEN"
 
+# Esri's esriReplicaTargetType enum: Undefined (0), Client (1), Server (2).
 SERVER_TYPE = "esriReplicaTargetTypeServer"
+CLIENT_TYPE = "esriReplicaTargetTypeClient"
 DATASET_TYPES = ("esriDTFeatureClass", "esriDTTable")
 # Field types that are never rewritten. A rewrite of these is not a no-op.
 SKIP_FIELD_TYPES = ("esriFieldTypeOID", "esriFieldTypeGeometry",
@@ -102,11 +106,13 @@ NOT_SYNCING = "NOT_SYNCING"
 NO_ACK = "NO_ACK"
 NO_DATASET = "NO_DATASET"
 CLIENT = "CLIENT"
+NO_TYPE = "NO_TYPE"
+SHORT_LOG = "SHORT_LOG"
 NO_ANCHOR = "NO_ANCHOR"
 EXCLUDED = "EXCLUDED"
 # Anchors held, and no edit moves them or the tool could not judge. A clean
 # exit here would be the false green this tool exists to end.
-UNJUDGED = (NOT_SYNCING, NO_ACK, NO_DATASET)
+UNJUDGED = (NOT_SYNCING, NO_ACK, NO_DATASET, NO_TYPE, SHORT_LOG)
 
 REQUIRED = {
     "versions": ("name",),
@@ -331,9 +337,19 @@ def analyse(model, min_idle_days=DEFAULT_MIN_IDLE_DAYS,
             v["status"] = EXCLUDED
         elif not anchors:
             v["status"] = NO_ANCHOR
-        elif rep["target_type"] != SERVER_TYPE:
+        elif rep["target_type"] == CLIENT_TYPE:
             v["status"] = CLIENT
-            v["detail"] = "not a server-type replica, so it is never edited"
+            v["detail"] = ("a client-type replica, so it is never edited. It "
+                           "holds anchors, and it is listed but never a "
+                           "finding")
+        elif rep["target_type"] != SERVER_TYPE:
+            # Undefined, absent or unrecognised. Calling it a client would be
+            # a clean exit for a replica that may be idle.
+            v["status"] = NO_TYPE
+            v["detail"] = ("holds %d anchor version(s), and its TargetType is "
+                           "missing, Undefined or not recognised, so the tool "
+                           "cannot say whether an edit moves it"
+                           % len(anchors))
         elif not ok or as_of - ok[-1][0] > datetime.timedelta(
                 days=silent_days):
             v["status"] = NOT_SYNCING
@@ -347,30 +363,41 @@ def analyse(model, min_idle_days=DEFAULT_MIN_IDLE_DAYS,
         elif not good:
             v["status"] = NO_ACK
             v["detail"] = ("holds %d anchor version(s) and syncs, but the "
-                           "log has no successful event %d row, so the "
+                           "log holds no successful row of event %d, so the "
                            "acknowledged generation is unknown"
                            % (len(anchors), event))
         else:
-            moved = good[0][0]
+            moved = None
             for before, after in zip(good, good[1:]):
                 if after[3] != before[3]:
                     moved = after[0]
-            idle = (as_of - moved).days
+            # No change of generation in the rows kept: the first row is only
+            # a lower bound on how long the generation has stood still.
+            bound = moved is None
+            idle = (as_of - (good[0][0] if bound else moved)).days
             gen = good[-1][3]
-            if idle < min_idle_days:
+            span = ("at least %d" if bound else "%d") % idle
+            if idle < min_idle_days and bound:
+                v["status"] = SHORT_LOG
+                v["detail"] = ("generation %d showed no change in the %d "
+                               "day(s) the log covers, under the %d-day "
+                               "limit, so how long it has stood still is "
+                               "unknown. Export the whole replica log."
+                               % (gen, idle, min_idle_days))
+            elif idle < min_idle_days:
                 v["status"] = ACTIVE
                 v["detail"] = ("generation %d moved %d day(s) ago, under "
                                "the %d-day limit" % (gen, idle,
                                                      min_idle_days))
             elif not rep["datasets"]:
                 v["status"] = NO_DATASET
-                v["detail"] = ("generation %d unchanged for %d day(s), but "
+                v["detail"] = ("generation %d unchanged for %s day(s), but "
                                "the definition lists no feature class or "
-                               "table to edit" % (gen, idle))
+                               "table to edit" % (gen, span))
             else:
-                v["detail"] = ("generation %d unchanged for %d day(s); "
+                v["detail"] = ("generation %d unchanged for %s day(s); "
                                "holds %d anchor version(s)"
-                               % (gen, idle, len(anchors)))
+                               % (gen, span, len(anchors)))
                 keys = [(d[0].upper(), d[1]) for d in rep["datasets"]]
                 hit = next((k for k in keys if k in chosen), None)
                 if hit is None:
@@ -455,14 +482,23 @@ def describe(report, min_idle_days, applied=None, apply=False):
     idle = len([v for v in report["verdicts"] if v["status"] in (IDLE,
                                                                  COVERED)])
     unjudged = len([v for v in report["verdicts"] if v["status"] in UNJUDGED])
+    marks = [a.split(" ")[0] for a in (applied or {}).values()]
+    if not apply:
+        ending = "Nothing was written."
+    elif not marks:
+        ending = "No edit was planned, so nothing was written."
+    elif "FAILED" in marks:
+        ending = "An edit FAILED. Read the lines above."
+    elif "UNVERIFIED" in marks:
+        ending = ("Every edit was sent, but at least one could not be "
+                  "checked. Read the lines above.")
+    else:
+        ending = "Every edit was made and checked."
     lines.append("VERDICT: %d idle replica(s) at %d day(s) or more, %d "
                  "edit(s) planned; %d more hold anchors that an edit cannot "
                  "move or that could not be judged. %s" % (
                      idle, min_idle_days, len(report["edits"]), unjudged,
-                     "Nothing was written." if not apply
-                     else "Every edit was made as listed."
-                     if all(a.startswith("APPLIED") for a in applied.values())
-                     else "An edit FAILED. Read the lines above."))
+                     ending))
     return lines
 
 
@@ -590,17 +626,23 @@ def preflight(edit, token):
     pick = {"oid": oids[0], "field": field, "objectid": min(ids),
             "stamp": track.get("editDateField")
             if isinstance(track.get("editDateField"), str) else None}
-    attrs = read_row(url, token, pick, pick["objectid"])
-    pick["value"] = attrs[field]
-    pick["before"] = attrs.get(pick["stamp"]) if pick["stamp"] else None
+    read_row(url, token, pick, pick["objectid"])
     return pick
 
 
 def write_edit(edit, pick, token):
-    """Rewrite the picked field with its own value, then check it landed."""
+    """Rewrite the picked field with its own value, then check it landed.
+
+    Returns (checked, text). The row is read again just before the write, so
+    the value sent and the edit date compared are the current ones. Two edits
+    can pick one row, and a stamp read in phase one would call the second
+    edit confirmed by the first.
+    """
     url = edit["target"]
+    row = read_row(url, token, pick, pick["objectid"])
+    before = row.get(pick["stamp"]) if pick["stamp"] else None
     update = {"attributes": {pick["oid"]: pick["objectid"],
-                             pick["field"]: pick["value"]}}
+                             pick["field"]: row[pick["field"]]}}
     data = call(url + "/applyEdits", {"updates": json.dumps([update]),
                                       "rollbackOnFailure": "true",
                                       "f": "json"}, token)
@@ -611,14 +653,15 @@ def write_edit(edit, pick, token):
     done = "OBJECTID %d, field %s rewritten with its own value" % (
         pick["objectid"], pick["field"])
     if not pick["stamp"]:
-        return done + ". Editor tracking is off on this layer, so the edit " \
-            "cannot be checked here. Export again after the next sync."
+        return False, (done + ". Editor tracking is off on this layer, so "
+                       "the edit cannot be checked here. The replica stays a "
+                       "finding. Export again after the next sync.")
     after = read_row(url, token, pick, pick["objectid"]).get(pick["stamp"])
-    if after is None or after == pick["before"]:
+    if after is None or after == before:
         raise ApplyError("the service said success, but the last edit date "
                          "did not move. The edit may not have reached the "
                          "geodatabase.")
-    return done + ". The last edit date moved."
+    return True, done + ". The last edit date moved."
 
 
 def apply_plan(report, token, max_edits):
@@ -647,8 +690,9 @@ def apply_plan(report, token, max_edits):
     applied, failed = {}, False
     for e in edits:
         try:
-            applied[e["replica"]] = "APPLIED " + write_edit(
-                e, picks[e["replica"]], token)
+            checked, text = write_edit(e, picks[e["replica"]], token)
+            applied[e["replica"]] = ("APPLIED " if checked
+                                     else "UNVERIFIED ") + text
         except ApplyError as exc:
             failed = True
             applied[e["replica"]] = "FAILED " + str(exc)
@@ -1058,7 +1102,10 @@ class Stub(object):
         if leaf == "applyEdits":
             for u in json.loads(params["updates"]):
                 rows[u["attributes"]["OBJECTID"]].update(u["attributes"])
-                if layer["tracking"]:
+                layer["writes"] += 1
+                if layer["tracking"] and (layer["freeze_after"] is None
+                                          or layer["writes"]
+                                          <= layer["freeze_after"]):
                     self.clock += 1
                     rows[u["attributes"]["OBJECTID"]]["EDITED"] = (
                         None if layer["tracking"] == "null" else self.clock)
@@ -1098,7 +1145,7 @@ class Stub(object):
         meta.update(info)
         self.layers["/arcgis/rest/services/%s/FeatureServer/0" % name] = {
             "info": meta, "tracking": tracking, "apply": None, "raw": {},
-            "ids": {}, "rows": {
+            "writes": 0, "freeze_after": None, "ids": {}, "rows": {
                 7: {"OBJECTID": 7, "EDITOR": "a", "EDITED": 1, "LABEL": "x"},
                 9: {"OBJECTID": 9, "EDITOR": "b", "EDITED": 2, "LABEL": "y"}}}
         return self.base + "/arcgis/rest/services/%s/FeatureServer/0" % name
@@ -1361,6 +1408,32 @@ def self_test():
           == NOT_SYNCING,
           "a replica whose last good sync was exactly --silent-days ago "
           "still syncs; one day more and it does not  <-- pinned defect")
+    # TargetType: only Client is a client. Undefined, absent and a misspelling
+    # are unjudged, never a clean exit.
+    for odd in ("esriReplicaTargetTypeUndefined", "",
+                "esriReplicaTargetTypeserver"):
+        typed = fixture()
+        typed["replicas"][2]["definition"] = definition(
+            103, "c", target=odd, datasets=[(PLANTS, FEATURE, "")])
+        found = dict((v["id"], v) for v in analyse(build(**typed))["verdicts"])
+        check(found[103]["status"] == NO_TYPE and found[103]["edit"] is None
+              and gate(analyse(build(**typed)), "idle", repaired=set(
+                  [101, 102, 104, 106, 107, 108])) == 1,
+              "a replica whose TargetType is %r is NO_TYPE and a finding, "
+              "not a client and not a clean exit  <-- pinned defect"
+              % odd)
+    short = relog((9003,), [lr(9003, 3, 12)])
+    check(short[103]["status"] == SHORT_LOG and short[103]["edit"] is None
+          and "unknown" in short[103]["detail"],
+          "a log that covers 3 days with one generation does not say the "
+          "replica moved 3 days ago  <-- pinned defect")
+    check(relog((9003,), [lr(9003, 3, 12)], min_idle_days=3)[103]["status"]
+          == IDLE
+          and "at least 100 day(s)" in relog((9003,), [lr(9003, 100, 12),
+                                                       lr(9003, 1, 12)]
+                                             )[103]["detail"],
+          "a log of exactly --min-idle-days with one generation is IDLE, "
+          "and an unchanged run is worded as a lower bound")
     backwards = fixture()
     backwards["replica_log"].reverse()
     check([(v["id"], v["status"]) for v in analyse(build(**backwards))
@@ -1421,7 +1494,8 @@ def self_test():
     check((gate(quiet, "idle"), gate(quiet, "any")) == (0, 1),
           "an anchor with no replica is a finding only under --exit-on any")
     quiet["detached"] = []
-    for status in (IDLE, COVERED, NOT_SYNCING, NO_ACK, NO_DATASET):
+    for status in (IDLE, COVERED, NOT_SYNCING, NO_ACK, NO_DATASET, NO_TYPE,
+                   SHORT_LOG):
         quiet["verdicts"][0]["status"] = status
         check((gate(quiet, "idle"), gate(quiet, "any"), gate(quiet, "never"))
               == (1, 1, 0),
@@ -1460,6 +1534,15 @@ def self_test():
           "every shown replica gets one line")
     check("target: none" in text and "covers 101, 102" in text,
           "the plan names the replicas one edit covers")
+    check("  edit 2 of 3 for replica 103 (covers 103): dataset "
+          "SYNTHDB.OWNER.PLANTS, filter (KIND='B')" in text
+          and "dataset SYNTHDB.OWNER.ROADS, filter none" in text,
+          "the plan numbers each edit and prints its filter, or none")
+    check("generation 4 moved 2 day(s) ago" in by[109]["detail"],
+          "the detail line shows the newest generation, not the one before")
+    check((DEFAULT_MIN_IDLE_DAYS, DEFAULT_SILENT_DAYS, DEFAULT_MAX_EDITS,
+           DEFAULT_EVENT) == (6, 3, 10, 1),
+          "the shipped defaults are the ones the README table lists")
     check(describe(analyse(model, only=set([109])), 6)[-3] == "  no edit "
           "planned", "an empty plan says so")
 
@@ -1540,7 +1623,7 @@ def self_test():
               "--only 109 plans nothing and exits 0")
         code, out, err = run(argv + ["--min-idle-days", "200"])
         check(code == 1 and "VERDICT: 0 idle replica(s)" in out
-              and "2 more hold anchors" in out,
+              and "6 more hold anchors" in out,
               "a limit above every idle time leaves no idle replica, but "
               "the replicas that cannot be judged still make exit 1  "
               "<-- pinned defect")
@@ -1673,7 +1756,7 @@ def self_test():
         updates = [json.loads(r["params"]["updates"]) for r in sent]
         check(code == 0 and text.count("APPLIED") == 3
               and "VERDICT: 4 idle replica(s)" in text
-              and "Every edit was made as listed" in text,
+              and "Every edit was made and checked" in text,
               "--apply makes the three planned edits, reports them, and "
               "exits 0 because every idle replica was repaired")
         check(all(r["token"] == "Bearer " + secret for r in stub.requests),
@@ -1699,8 +1782,11 @@ def self_test():
               "back the value the row already held  <-- pinned defect")
         first = min(i for i, r in enumerate(stub.requests)
                     if r["path"].endswith("/applyEdits"))
-        check(first == 9 and len(sent) == 3,
-              "every layer and row is read before the first write")
+        check(first == 10 and len(sent) == 3 and all(
+            r["method"] == "GET" or r["path"].endswith("/query")
+            for r in stub.requests[:first]),
+              "every layer and row is read before the first write, and the "
+              "first row is read once more just before it")
         check(all(r["params"].get("rollbackOnFailure") == "true"
                   for r in sent),
               "every edit asks the service to roll back on failure  "
@@ -1740,10 +1826,39 @@ def self_test():
 
         stub = setup(tracking=False)
         code, out, err, text = go(stub, env=None)
-        check(code == 0 and "Editor tracking is off" in text
+        check(code == 1 and "Editor tracking is off" in text
+              and text.count("    UNVERIFIED ") == 3 and "APPLIED" not in text
+              and "could not be checked" in text and len(writes(stub)) == 3
               and all(r["token"] is None for r in stub.requests),
-              "a layer with no editor tracking is edited and says it cannot "
-              "be checked; no token means no header")
+              "a layer with no editor tracking is edited, says it cannot be "
+              "checked, and leaves its replicas findings (exit 1, not 0)  "
+              "<-- pinned defect")
+
+        # Two edits that pick one row: the stamp of the first write must not
+        # confirm the second. The stub stops stamping after two writes.
+        stub = setup()
+        stub.layer("plants")["freeze_after"] = 2
+        put("tg2.csv", "dataset,layer_url\nOWNER.PLANTS,%s\nROADS,%s\n"
+            % ((stub.base + "/arcgis/rest/services/plants/FeatureServer/0",)
+               * 2))
+        code, out, err, text = go(stub)
+        check(code == 2 and text.count("    APPLIED ") == 2
+              and text.count("    FAILED ") == 1 and "did not move" in text
+              and len(writes(stub)) == 3,
+              "a third edit of a row that two edits already stamped is "
+              "checked against the stamp just before its own write  "
+              "<-- pinned defect")
+        stub = setup()
+        code, out, err = run(argv + [
+            "--targets", path("tg2.csv"), "--report", path("zero.txt"),
+            "--apply", "--only", "109"], env=secret)
+        stub.close()
+        with open(path("zero.txt"), encoding="utf-8") as handle:
+            zero = handle.read()
+        check(code == 0 and not stub.requests
+              and "No edit was planned, so nothing was written" in zero
+              and "made and checked" not in zero,
+              "a zero-edit --apply run does not claim every edit was made")
 
         stub = setup()
         stub.layer("plants")["tracking"] = False

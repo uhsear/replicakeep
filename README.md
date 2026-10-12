@@ -28,8 +28,12 @@ that could move each one. Without `--apply` it only prints the plan. With `--app
 the edits through the REST API of a feature service that you name.
 
 A clean exit from this tool means it looked and found nothing. It never means it could not
-tell. A replica log with no usable rows, a replica that holds anchors and does not sync, and a
-replica with no known generation are all exit 1 or exit 2, not exit 0.
+tell. A replica log with no usable rows, a replica that holds anchors and does not sync, a
+replica with no known generation, a replica whose `TargetType` the tool does not recognise, a
+log too short to show how long a generation stood still, and an edit that could not be checked
+are all exit 1 or exit 2, not exit 0. After `--apply`, exit 0 means the service accepted each
+edit and moved its row's edit date. It does not mean any replica moved: only a later export
+shows that.
 
 ```
 replicakeep self-test: no database, no real service, no credentials
@@ -46,7 +50,11 @@ PASS  an empty replica log is refused, never read as no replica syncing  <-- pin
 ...
 PASS  a replica whose recent syncs all fail is NOT_SYNCING, not IDLE, and gets no edit  <-- pinned defect
 ...
-PASS  a NOT_SYNCING replica is a finding by default, never a clean exit  <-- pinned defect
+PASS  a replica whose TargetType is 'esriReplicaTargetTypeUndefined' is NO_TYPE and a finding, not a client and not a clean exit  <-- pinned defect
+...
+PASS  a log that covers 3 days with one generation does not say the replica moved 3 days ago  <-- pinned defect
+...
+PASS  a NO_TYPE replica is a finding by default, never a clean exit  <-- pinned defect
 ...
 PASS  the abbreviation --ap is refused by the parser  <-- pinned defect
 ...
@@ -55,16 +63,19 @@ PASS  a token with '\r\n' after it is trimmed, not rejected  <-- pinned defect
 ...
 PASS  a token with a space, a control or a non-ASCII character is refused before the report is opened, and its text is never echoed  <-- pinned defect
 ...
+PASS  a layer with no editor tracking is edited, says it cannot be checked, and leaves its replicas findings (exit 1, not 0)  <-- pinned defect
+PASS  a third edit of a row that two edits already stamped is checked against the stamp just before its own write  <-- pinned defect
+...
 PASS  an attribute field that is not editable stops the run before the first write  <-- pinned defect
 ...
 PASS  a redirect is refused, so the token is never resent to its target  <-- pinned defect
 ...
 PASS  a plan-only run never prints a target URL that holds a query string or login  <-- pinned defect
 ...
-209 assertions, 0 failed
+221 assertions, 0 failed
 ```
 
-The block above is a real run, cut to 15 of its 209 PASS lines. Each line is verbatim, and
+The block above is a real run, cut to 19 of its 221 PASS lines. Each line is verbatim, and
 `...` marks the lines left out.
 
 ## What already exists
@@ -105,9 +116,9 @@ exists.
 Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-party package.
 The tool reads files, and under `--apply` it calls a feature service over HTTP.
 
-The same 209 assertions pass on Windows (Python 3.13.2), on Windows (Python 3.9.25) and on
-Ubuntu 24.04 (Python 3.12.3). The labels of the PASS lines are identical on all three. The
-self-test takes about 6 seconds on Windows. Branch coverage of `replicakeep.py` is 100 percent with one
+The same 221 assertions pass on Windows (Python 3.13.2), on Windows (Python 3.9.25) and on
+Ubuntu 24.04 (Python 3.12.3). The output is identical on all three apart from line endings. The
+self-test takes about 7 seconds on Windows. Branch coverage of `replicakeep.py` is 100 percent with one
 pragma. See "Coverage".
 
 ```
@@ -161,7 +172,7 @@ for seven prefixes: `--ap`, `--repor`, `--replica-l`, `--exit`, `--vers`, `--min
 | Code | Meaning |
 |---|---|
 | 0 | No finding at the `--exit-on` level. After a successful `--apply`, the replicas that were edited are not findings. |
-| 1 | At least one finding. By default (`--exit-on idle`) a finding is an idle replica that the run did not repair, or a replica that holds anchors and that the tool could not judge or no edit can move: `NOT_SYNCING`, `NO_ACK` or `NO_DATASET`. `--exit-on any` also counts an anchor with no replica item. |
+| 1 | At least one finding. By default (`--exit-on idle`) a finding is an idle replica that the run did not repair, or a replica that holds anchors and that the tool could not judge or no edit can move: `NOT_SYNCING`, `NO_ACK`, `NO_DATASET`, `NO_TYPE` or `SHORT_LOG`. An `--apply` edit that the tool could not check leaves its replicas idle, so it is a finding too. `--exit-on any` also counts an anchor with no replica item. |
 | 2 | The tool could not do its job: an export could not be read, an export is empty or disagrees with itself, a flag or the token was wrong, a URL was refused, a read failed, or an edit was refused or could not be checked. Three more cases are exit 2: a replica log with no row for any replica that holds anchors, anchors with no usable replica item, and an `--only` id that no replica item carries. |
 
 Exit 2 is kept apart from exit 1 on purpose. A scheduler that cannot tell "the tool failed"
@@ -169,8 +180,9 @@ from "findings exist" will show a failure every day, or will hide one. These are
 that [compressfloor](https://github.com/uhsear/compressfloor) uses, so one monitor can read both.
 `--exit-on never` keeps exit 2 and turns every finding into exit 0.
 
-The three statuses `NOT_SYNCING`, `NO_ACK` and `NO_DATASET` are findings by default. An earlier
-version left them at exit 0. In each of them a replica holds anchors, and the tool either cannot
+The five statuses `NOT_SYNCING`, `NO_ACK`, `NO_DATASET`, `NO_TYPE` and `SHORT_LOG` are findings
+by default. An earlier version left the first three at exit 0, and called a missing `TargetType`
+a client. In each of them a replica holds anchors, and the tool either cannot
 move them or cannot tell. An exit 0 there would be the same false green that the opening
 describes. If a replica syncs less often than `--silent-days`, raise that limit. Then the tool
 reads its last good sync, and plans an edit if it is idle.
@@ -230,7 +242,7 @@ filter such as `KIND IN ('A','B')` holds a comma. Use a client that quotes, or e
 
 ## What it decides
 
-For every server-type replica that holds anchors (`SYNC_SEND_`, `SYNC_RECEIVE_` or
+For every replica that holds anchors (`SYNC_SEND_`, `SYNC_RECEIVE_` or
 `SYNC_RECEIVE_REC_` followed by the replica ID and a generation, as TA 000011719 names them),
 it takes one status. A syncing replica is one with a successful logged event of any kind
 (an `errorcode` equal to the success code) in the last `--silent-days`. A replica whose recent
@@ -240,20 +252,28 @@ events are all failures does not sync.
 |---|---|---|
 | `IDLE` | The replica syncs, and its acknowledged generation has not changed for `--min-idle-days` or more. | An edit is planned. |
 | `COVERED` | Same as `IDLE`, and an earlier replica's edit uses the same dataset and the same filter. | No second edit. One edit covers both. |
-| `ACTIVE` | The generation moved less than `--min-idle-days` ago. | Nothing. |
+| `ACTIVE` | The generation changed less than `--min-idle-days` ago, within the log rows kept. | Nothing. |
+| `SHORT_LOG` | The generation never changed in the rows kept, and those rows cover fewer than `--min-idle-days` days. | Nothing. How long the generation has stood still is unknown, so it is not called active. Export the whole log. Exit 1 by default. |
 | `NOT_SYNCING` | No successful event for more than `--silent-days`, or no log row at all. | Nothing. An edit cannot help a replica that does not sync. The report points to `compressfloor --unregister-plan`. Exit 1 by default. |
-| `NO_ACK` | It syncs, but the log has no successful row of the chosen event. | Nothing. The generation is unknown. Exit 1 by default. |
+| `NO_ACK` | It syncs, but the log holds no successful row of the chosen event. | Nothing. The generation is unknown. Exit 1 by default. |
 | `NO_DATASET` | Idle, but the definition lists no feature class or table. | Nothing. Exit 1 by default. |
-| `CLIENT` | Not a server-type replica, such as a Field Maps offline replica. | Never edited. |
+| `NO_TYPE` | `TargetType` is missing, `esriReplicaTargetTypeUndefined` or a value the tool does not know. | Nothing. The tool cannot say whether an edit moves it. Exit 1 by default. |
+| `CLIENT` | `TargetType` is `esriReplicaTargetTypeClient`. | Never edited, listed, and never a finding, although it holds anchors. |
 
 A replica that holds no anchor pins nothing and is left alone. An anchor whose replica ID has no
 `Replica` item is reported as an anchor without a replica item. Run compressfloor on those. It
 names detached versions, and replicakeep cannot help them.
 
 The idle time runs from the date of the last change of generation among the successful rows of
-the chosen event, to the database clock. The first row is a lower bound, not a start. A replica
-whose generation changed 40 days ago, after 90 quiet days, is idle for 40 days. The self-test
-pins this.
+the chosen event, to the database clock. A replica whose generation changed 40 days ago, after
+90 quiet days, is idle for 40 days. The self-test pins this. When the generation never changes
+in the rows kept, the first row is only a lower bound. The report then says "at least N day(s)"
+and plans an edit if N reaches the limit. If N is under the limit, the status is `SHORT_LOG`,
+because the tool cannot know how long the generation stood still.
+
+Esri's `esriReplicaTargetType` enum has three values: Undefined (0, replicas made by workflows
+that do not use the feature service REST sync API), Client (1) and Server (2). Only Server is
+planned for an edit. Only Client is `CLIENT`. Everything else is `NO_TYPE`.
 
 A `COVERED` replica depends on the observation that replicas sharing a dataset share one edit.
 The tool does not share an edit across two filters. The edit must satisfy each replica's own
@@ -269,10 +289,13 @@ picks the first editable attribute field that is not a tracking field, asks for 
 that satisfy the filter, takes the lowest, and reads that row without geometry. If any of these
 reads fails, the run stops before the first write and exits 2.
 
-Phase two writes. For each edit it sends one `applyEdits` request with one update and
-`rollbackOnFailure` set to `true`. The update holds the object ID and the one field, with the
-value the row already had. It sends no geometry. Then it reads the row back. If the layer has
-editor tracking, the last edit date must have changed, or the edit is reported as failed.
+Phase two writes. For each edit it first reads the row again, because an earlier edit of the
+same run may have picked the same row and moved its edit date. Then it sends one `applyEdits`
+request with one update and `rollbackOnFailure` set to `true`. The update holds the object ID
+and the one field, with the value the row held at that second read. It sends no geometry. Then
+it reads the row back. If the layer has editor tracking, the last edit date must differ from the
+second read, or the edit is reported as failed. If the layer has no editor tracking, the edit is
+reported as `UNVERIFIED`, its replicas stay findings, and the run exits 1.
 
 The edit is a real edit. If editor tracking is on, it restamps the editor and the edit date of
 that one row. That is the cost of the repair, and the plan says so before any write.
@@ -297,14 +320,14 @@ replicakeep: idle replicas that may hold the compress floor
 as of 2026-03-31 12:00:00, the database clock of the versions export
 This is an observation. An edit is the repair that was seen to work; the proof is a later export showing the generation moved.
 
-IDLE        replica 101 'alpha_to_web': generation 12 unchanged for 100 day(s); holds 3 anchor version(s)
-COVERED     replica 102 'bravo_to_web': generation 12 unchanged for 100 day(s); holds 2 anchor version(s)
-IDLE        replica 103 'charlie_to_web': generation 12 unchanged for 100 day(s); holds 2 anchor version(s)
+IDLE        replica 101 'alpha_to_web': generation 12 unchanged for at least 100 day(s); holds 3 anchor version(s)
+COVERED     replica 102 'bravo_to_web': generation 12 unchanged for at least 100 day(s); holds 2 anchor version(s)
+IDLE        replica 103 'charlie_to_web': generation 12 unchanged for at least 100 day(s); holds 2 anchor version(s)
 IDLE        replica 104 'delta_to_web': generation 6 unchanged for 40 day(s); holds 2 anchor version(s)
-CLIENT      replica 105 'echo_offline': not a server-type replica, so it is never edited
+CLIENT      replica 105 'echo_offline': a client-type replica, so it is never edited. It holds anchors, and it is listed but never a finding
 NOT_SYNCING replica 106 'foxtrot_to_web': holds 2 anchor version(s) and logged no successful event in the last 3 day(s). An edit cannot help a replica that does not sync. If it syncs less often, raise --silent-days. If it is abandoned, compressfloor --unregister-plan orders its removal.
-NO_ACK      replica 107 'golf_to_web': holds 2 anchor version(s) and syncs, but the log has no successful event 1 row, so the acknowledged generation is unknown
-NO_DATASET  replica 108 'hotel_to_web': generation 4 unchanged for 100 day(s), but the definition lists no feature class or table to edit
+NO_ACK      replica 107 'golf_to_web': holds 2 anchor version(s) and syncs, but the log holds no successful row of event 1, so the acknowledged generation is unknown
+NO_DATASET  replica 108 'hotel_to_web': generation 4 unchanged for at least 100 day(s), but the definition lists no feature class or table to edit
 ACTIVE      replica 109 'india_to_web': generation 4 moved 2 day(s) ago, under the 6-day limit
 1 replica item(s) hold no anchor or were left out by --only; 2 item(s) were not a usable GPReplica.
 ANCHOR WITHOUT A REPLICA ITEM: replica id(s) 77. No edit helps these. Run compressfloor, which names them.
@@ -346,7 +369,7 @@ PLAN
     target: http://127.0.0.1:56131/arcgis/rest/services/roads/FeatureServer/0
     APPLIED OBJECTID 7, field LABEL rewritten with its own value. The last edit date moved.
 
-VERDICT: 4 idle replica(s) at 6 day(s) or more, 3 edit(s) planned; 3 more hold anchors that an edit cannot move or that could not be judged. Every edit was made as listed.
+VERDICT: 4 idle replica(s) at 6 day(s) or more, 3 edit(s) planned; 3 more hold anchors that an edit cannot move or that could not be judged. Every edit was made and checked.
 
 wrote plan.txt
 exit 1
@@ -354,7 +377,7 @@ exit 1
 
 The exit code is 1 on purpose. The three idle replicas were edited and are no longer findings,
 but replicas 106, 107 and 108 still hold anchors that this run cannot move or judge. The run
-sent nine read requests before its first write. After the three edits, the stub's rows held
+sent ten read requests before its first write: nine in phase one, and one more read of the first row. After the three edits, the stub's rows held
 their old values and a newer edit date. Nothing in the output, the report or any URL held the
 token. The next step is outside the tool: wait for the next sync, export again, and run the
 plan again. A replica whose generation moved is `ACTIVE` in that second plan.
@@ -375,6 +398,11 @@ plan again. A replica whose generation moved is `ACTIVE` in that second plan.
 | An unexpected error exits 2, not 1 | Self-test: `analyse` is replaced in turn by functions that raise `ZeroDivisionError`, `KeyError` and `OverflowError`. |
 | An empty log, an unjoined log, no readable replica item and an unknown `--only` id exit 2 | Self-test, each by a call and a header-only log by the command line. |
 | A replica that cannot be judged is exit 1 | Self-test: each status through `gate`, and two runs of `main()`, one of them after a successful `--apply`. |
+| A missing, Undefined or misspelled `TargetType` is `NO_TYPE`, not a client | Self-test: three definitions through `build` and `analyse`, each a finding through `gate`. |
+| A log too short to show a change is `SHORT_LOG`, not `ACTIVE` | Self-test: a 3-day log with one generation, and a 100-day log worded "at least 100". |
+| An edit on a layer without editor tracking is not a repair | Self-test, against the stub: three `UNVERIFIED` lines, exit 1, replicas still findings. |
+| A second edit of a row is checked against its own before-stamp | Self-test, against the stub, which stops stamping after two writes: the third edit fails and the run exits 2. |
+| A zero-edit `--apply` run does not claim an edit was made | Self-test: `--only 109` with `--apply`, no request reaches the stub. |
 | The JSON form of a targets file works | Self-test: a plan-only run with a JSON targets file. |
 | The PostgreSQL queries produce the exports | A run on 2026-10-12 against PostgreSQL 16.15 with `psql --csv`, compared with the fixture's own plan. |
 | A DTD in a definition is refused | Self-test. |
@@ -394,7 +422,7 @@ the self-test.
 ```
 python -m coverage run --branch replicakeep.py --self-test
 python -m coverage report -m
-replicakeep.py 1022 0 266 0 100%
+replicakeep.py 1067 0 280 0 100%
 ```
 
 The file ends with `if __name__ == "__main__":  # pragma: no branch`. Coverage runs the file
@@ -409,8 +437,9 @@ arm is the only difference. No other line is excluded.
 - **XML element names are observed, not documented.** Esri's Technical Article 000011719
   documents `/GPReplica/ID` and `/GPReplica/Name`. The tool also reads `TargetType`,
   `GPReplicaDataset`, `DatasetName`, `DatasetType` and `DefQuery`, as seen in the definitions
-  this was built from. A different version could name them differently, and the tool would
-  then find no dataset and plan no edit.
+  this was built from. A different version could name them differently. A missing
+  or renamed `TargetType` reads as `NO_TYPE`, and a missing dataset list as `NO_DATASET`. Both
+  exit 1 and plan no edit.
 - **A definition whose root declares a default namespace is not read.** Its replica is counted
   as unread, and its anchors are reported as an anchor without a replica item. If no
   definition at all can be read while anchors exist, the run exits 2.
@@ -430,12 +459,13 @@ arm is the only difference. No other line is excluded.
   millisecond, or a number with more digits than JSON keeps, could change.
 - **The tool does not know that an edit moved the replica.** It checks that the service accepted
   the edit and, with editor tracking, that the row's edit date moved. Whether the replica's
-  generation moves is visible only in a later export.
+  generation moves is visible only in a later export. Exit 0 after `--apply` means the service
+  accepted the edits, not that any replica moved. A scheduler sees green on the run that made
+  the edit.
 - **Editor tracking.** Esri's pages do not say that every edit restamps the tracking fields. The
   tool reads the edit date back and reports a layer where it did not move as a failure. On a
-  layer without editor tracking the edit cannot be checked. It is reported as `APPLIED`, the
-  run can exit 0, and the last line says "Every edit was made as listed." Only a later export
-  shows whether the generation moved.
+  layer without editor tracking the edit cannot be checked. It is reported as `UNVERIFIED`,
+  its replicas stay findings, and the run exits 1. Run the plan again after the next sync.
 - **A layer with an attribute rule or a database trigger on update may change other data** when
   the one field is rewritten. The tool cannot see this.
 - **Branch versioned layers are refused**, and the tool edits only the version a service is
@@ -473,12 +503,11 @@ arm is the only difference. No other line is excluded.
 - **`--report` overwrites its file.** It is opened for writing before the first edit, so a file
   of that name is truncated, even when the run then refuses. Do not point it at an export or
   the targets file. The tool does not check.
-- **A zero-edit `--apply` run says "Every edit was made as listed."** The line is vacuous. No
-  edit was planned.
 - **Export the whole replica log.** The idle time runs from the first log row when the
-  generation never changes. A log cut to recent rows under-reports the idle time. The detail
-  line then says "generation N moved D day(s) ago", with D the age of the first row kept, and an
-  idle replica reads `ACTIVE` and exits 0. A log cut to one recent row showed it.
+  generation never changes. A log cut to recent rows cannot show how long a generation
+  stood still. If the rows kept cover fewer days than `--min-idle-days`, the replica reads
+  `SHORT_LOG` and exits 1. If they cover more, the report says "at least N day(s)", which is
+  true but may be short.
 - **A blank cell in a log row stops the run.** A blank `errorcode`, `event`, `logdate` or
   `targetgen` in any row exits 2 and names the row. Filter or coalesce NULLs on failed events in
   the export.
@@ -490,6 +519,44 @@ arm is the only difference. No other line is excluded.
 - **The tool has not been run against a real geodatabase or a real feature service.** Every
   network path was run against a local stub, and the PostgreSQL queries against a synthetic
   schema. The SQL Server queries were not run.
+- **A client-type replica that holds anchors is listed but never a finding.** It can pin the
+  compress floor and no edit can move it, so exit 0 does not mean no replica holds the floor.
+- **The versions export must hold the bare version name**, such as `SYNC_SEND_101_3`, not
+  `OWNER.NAME`. A name with the owner in front matches no anchor, every replica reads
+  `NO_ANCHOR`, and the run exits 0.
+- **An anchor whose replica item exists but cannot be read is not a finding by default.**
+  Examples are a root with a default namespace, a `GPSyncReplica` root and an ID of -1. The run
+  reports an anchor without a replica item and exits 0 unless you give `--exit-on any`.
+- **`exported_at` and `logdate` are compared as clock readings, and the zone is dropped.**
+  Export both from the same database clock. If the log is in UTC and `exported_at` is local,
+  ages are off by the offset, and a log row later than `exported_at` exits 2.
+- **Take the versions export and the replica log export together.** A sync that lands between
+  them can put the newest log row after `exported_at`. The run then exits 2 and gives no verdict.
+- **A `DefQuery` with several statements or a spatial filter is sent as the `where` clause as
+  written.** The service may refuse it in phase one, which exits 2. The tool reads only the
+  attribute filter of a definition and ignores any spatial filter, so the picked row may lie
+  outside the replica's extent. This could not be checked offline.
+- **A short target name can match more than one schema.** `PLANTS` matches the dataset of every
+  schema that ends in `.PLANTS`. If two replicas use different schemas and the targets file
+  holds only the short name, both resolve to one layer, and one edit may read as the repair of
+  both. Name the owner in the targets file.
+- **Esri says that when archiving tracks replica changes, no system versions are created.** A
+  geodatabase that uses archiving has no anchors, and this tool reports nothing there.
+- **A token is optional under `--apply`.** With `REPLICAKEEP_TOKEN` unset or empty, every request
+  goes out without the header. A secured service then refuses the first read and the run exits 2
+  in phase one. A service that accepts anonymous edits would be edited without a credential.
+- **A service that puts the token in its own error text would print it.** The tool shows the
+  service's error message on stderr and in the `--report` file. Esri's services answer
+  "Invalid token." and do not echo it.
+- **The 30-second request timeout applies to each socket read**, not to a whole response. A
+  target that sends data slowly can hold the run for a long time.
+- **With a proxy set, a plain http loopback target goes to the proxy, and the token header
+  goes with it.**
+- **A mutation sweep of an earlier version left 24 of 332 mutants alive.** About 14 were
+  settings such as the default limits and the timeout. Three were real gaps: the filter printed
+  in the plan, the "edit N of M" numbering, and the generation shown in the detail line. The
+  self-test now asserts those three and pins the defaults. I did not rerun the whole sweep on
+  this version.
 - **A replica list that is empty is exit 2.** A zero-byte file is what a failed export leaves,
   and read as no replicas it would call every anchor detached.
 - **State locks are not visible.** A connected session's lock on an old state can hold compress
@@ -534,6 +601,10 @@ arm is the only difference. No other line is excluded.
   the last editor and last edit date fields.
 - [Feature object](https://developers.arcgis.com/rest/services-reference/enterprise/feature-object/):
   "All properties are optional."
+- [esriReplicaTargetType](https://desktop.arcgis.com/en/arcobjects/latest/net/esriReplicaTargetType.htm)
+  (ArcObjects, an archived page, fetched on 2026-10-12): Undefined (0), Client (1) and Server (2).
+  Undefined is "used for replicas created by workflows that don't involve the feature service's
+  REST-based sync API".
 
 ## Contributing
 

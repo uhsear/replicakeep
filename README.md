@@ -35,9 +35,10 @@ item the tool could not read may own, a version name that holds `SYNC_` and fits
 pattern, and an edit that could not be checked are all exit 1 or exit 2, not exit 0. Three
 cases stay exit 0 by design, and Limits names each. The first is a client-type replica that
 holds anchors. The second is an anchor with no replica item when every item in the export was
-read. The third is a run after `--apply`: exit 0 then means the service accepted each edit and
-moved its row's edit date. It does not mean any replica moved, because the export that the
-tool reads cannot show that. Only a later export shows it.
+read. The third is `--exit-on never`, which the operator asks for. A run after `--apply` is not
+one of them. The service may accept each edit and move its row's edit date, but the export that
+the tool read cannot show that any replica moved. The replicas stay findings and the run exits 1
+until a later export shows the generation moved.
 
 ```
 replicakeep self-test: no database, no real service, no credentials
@@ -97,10 +98,10 @@ PASS  the real clock: an export nobody refreshes ends at the timeout as UNKNOWN,
 ...
 PASS  a service error that echoes the token is printed without it  <-- pinned defect
 ...
-291 assertions, 0 failed
+297 assertions, 0 failed
 ```
 
-The block above is a real run, cut to 30 of its 291 PASS lines. Each line is verbatim, and
+The block above is a real run, cut to 30 of its 297 PASS lines. Each line is verbatim, and
 `...` marks the lines left out.
 
 The second half of the same trouble is the end of a replica that is abandoned. A replica that
@@ -153,11 +154,10 @@ exists.
 Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-party package.
 The tool reads files, and under `--apply` it calls a feature service over HTTP.
 
-The same 291 assertions pass on Windows (Python 3.13.2) and on Ubuntu 24.04 (Python 3.12.3),
+The same 297 assertions pass on Windows (Python 3.13.2) and on Ubuntu 24.04 (Python 3.12.3),
 and the output is identical apart from line endings. They also pass on Windows with Python
-3.11.8. No Python 3.9 was available for a run: the 3.9 floor is checked only by parsing the
-file with `feature_version=(3, 9)`. The
-self-test takes about 7 seconds on Windows, and about 1 second of those is real waits of the
+3.9.25, 3.10.20 and 3.11.15, so the 3.9 floor is run and not only parsed. The
+self-test takes about 8 seconds on Windows, part of it in real waits of the
 drain tests. Branch coverage of `replicakeep.py` is 100 percent with one
 pragma. See "Coverage".
 
@@ -220,8 +220,8 @@ for seven prefixes: `--ap`, `--repor`, `--replica-l`, `--exit`, `--vers`, `--min
 
 | Code | Meaning |
 |---|---|
-| 0 | No finding at the `--exit-on` level. After a successful `--apply`, the replicas that were edited are not findings. |
-| 1 | At least one finding. By default (`--exit-on idle`) a finding is an idle replica that the run did not repair, or a replica that holds anchors and that the tool could not judge or no edit can move: `NOT_SYNCING`, `NO_ACK`, `NO_DATASET`, `NO_TYPE` or `SHORT_LOG`. An `--apply` edit that the tool could not check leaves its replicas idle, so it is a finding too. So is an anchor with no replica item while another item could not be read, because that item may own it, and so is a version name that holds `SYNC_` and matches no anchor pattern. `--exit-on any` also counts an anchor with no replica item when every item was read. |
+| 0 | No finding at the `--exit-on` level. A replica whose edit was applied is still a finding, because only a later export shows that its generation moved. |
+| 1 | At least one finding. By default (`--exit-on idle`) a finding is an idle replica, edited or not, or a replica that holds anchors and that the tool could not judge or no edit can move: `NOT_SYNCING`, `NO_ACK`, `NO_DATASET`, `NO_TYPE` or `SHORT_LOG`. An `--apply` edit, checked or not, leaves its replicas idle in the export that was read, so it is a finding too. So is an anchor with no replica item while another item could not be read, because that item may own it, and so is a version name that holds `SYNC_` and matches no anchor pattern. `--exit-on any` also counts an anchor with no replica item when every item was read. |
 | 2 | The tool could not do its job: an export could not be read, an export is empty or disagrees with itself, a flag or the token was wrong, a URL was refused, a read failed, or an edit was refused (`FAILED`, which includes a failed read-back after the request). An edit that was accepted but could not be checked (`UNVERIFIED`) is exit 1, not exit 2. Three more cases are exit 2: a replica log with no row for any server-type replica that holds anchors, anchors while no item in the replicas export is a usable `GPReplica`, and an `--only` id that no replica item carries. |
 
 Exit 2 is kept apart from exit 1 on purpose. A scheduler that cannot tell "the tool failed"
@@ -258,7 +258,7 @@ anchors. That covers an empty or truncated log, and a log that joins to no repli
 | `versions` | `name`, `exported_at`, `row_count` | The export that compressfloor `--sql` prints works as it is. Other columns are ignored. |
 | `replicas` | `objectid`, `item_type`, `definition`, `row_count` | `definition` is the item's XML text. A `Sync Replica` item and an item with no usable ID are counted and left out. In `--await-drain` a `Sync Replica` item is read for its ID instead: a usable ID counts as a replica item, and an item with none is not counted as unread. |
 | `replica_log` | `replicaid`, `logdate`, `event`, `errorcode`, `targetgen`, `row_count` | Esri says `replicaid` corresponds to `objectid` in `GDB_ITEMS`, not to the ID inside the XML. The tool joins on `objectid`. Export the whole table. |
-| `targets` | `dataset`, `layer_url` | Written by hand. A dataset may be named in full or by its trailing parts, so `OWNER.TABLE` and `TABLE` both match `DB.OWNER.TABLE`. A dataset that matches two rows matches none. |
+| `targets` | `dataset`, `layer_url`, and optionally `layer_name` | Written by hand. A dataset may be named in full or by its trailing parts, so `OWNER.TABLE` and `TABLE` both match `DB.OWNER.TABLE`. A dataset that matches two rows matches none. Under `--apply` the layer must report a `name` that matches the dataset in the same way, or equals `layer_name` when the row gives one, whatever the case. A layer with another name, or none, stops the run in phase one, before any write. The Esri Layer page lists the name among the basic information that a layer returns ("its ID, name, fields, types, and templates"). |
 
 These PostgreSQL queries were run on 2026-10-12 with `psql --csv` against PostgreSQL 16.15
 (the `postgres:16-alpine` image, in a throwaway container that was removed afterward), over a
@@ -411,8 +411,9 @@ tells these apart. Without `--accept-empty-replicas` such an export gives `EMPTY
 The flag lifts nothing else: an id with a `SYNC_` version, an unreadable item or no proof of
 registration keeps its own status. No Esri page says that the last unregister leaves no row.
 That is an observation of one estate, not a rule.
-An empty versions export is refused, because `sde_versions` always holds `DEFAULT`, and
-read as no versions it would call every id drained. If `--before-replicas` does not show an id, only a reading that shows it registered or
+An empty versions export is refused. The tool assumes that `sde_versions` always holds
+`DEFAULT`, which no cited page states, and an empty file read as no versions would call every id
+drained. If `--before-replicas` does not show an id, only a reading that shows it registered or
 anchored can make it DRAINED.
 
 The defaults, 30 seconds and 1,800 seconds, are the numbers that compressfloor's plan prints.
@@ -520,8 +521,8 @@ wrote plan.txt
 exit 1
 ```
 
-The exit code is 1 on purpose. The three idle replicas were edited and are no longer findings,
-but replicas 106, 107 and 108 still hold anchors that this run cannot move or judge. The
+The exit code is 1 on purpose. The three edits were made and checked, but no export shows that
+a replica moved, so replicas 101 to 104 are still findings. Replicas 106, 107 and 108 also hold anchors that this run cannot move or judge. The
 anchor of replica id 77 counts too, because two items in the export could not be read. The run
 sent ten read requests before its first write: nine in phase one, and one more read of the first row. The row ids in this run are set by the self-test
 stub, so a run from the README's inputs alone shows OBJECTID 7 for edit 1, not 9. After the three edits, the stub's rows held
@@ -570,7 +571,9 @@ plan again. A replica whose generation moved is `ACTIVE` in that second plan.
 | An empty replicas export never gives DRAINED unless `--accept-empty-replicas` is given | Self-test: `drain_verdicts` and `wait_drain` with and without the flag, and the command line on a header-only file with and without it. The flag lifts no other status. |
 | `--exit-on`, `--apply`, `--report` and the plan flags are refused with `--await-drain` | Self-test, through the command line. |
 | A poll of 0 or less, a timeout below 0, `nan` or `inf` is refused | Self-test, through the command line. |
-| The idle-replica plan still gives the same verdicts after `build` was split into helpers | Self-test: all 230 earlier assertions are unchanged. |
+| The idle-replica plan still gives the same verdicts after `build` was split into helpers | Self-test: 228 of the 230 earlier assertions are unchanged. The other two changed with the exit code of a run after `--apply`. |
+| A dataset pointed at the layer of another dataset stops `--apply` before any write | Self-test: a stub whose layers are swapped, a layer with no name, a layer with another name, and a `layer_name` column that matches and one that does not. |
+| A run after `--apply` exits 1 until a later export shows the move | Self-test: `gate`, `main()` and the command line as a separate process. |
 
 I ran 13 one-line mutations of the drain code with a script: the freshness test on `exported_at`, the proof test, the blind test, the timeout test, the cut of the last sleep, the exit rule, the item test, the anchor test, the survival of a failed read, the proved set, the two flag bounds and the `--before-replicas` read. The self-test killed all 13. Three were killed by a hang and not by a failed assertion: a timeout test of `left < 0` and the two widened flag bounds make a run on the real clock go on for 1,800 seconds or more, and I stopped each at 60 seconds. The script is not in the repository.
 
@@ -595,7 +598,7 @@ the self-test.
 ```
 python -m coverage run --branch replicakeep.py --self-test
 python -m coverage report -m
-replicakeep.py 1419 0 356 0 100%
+replicakeep.py 1439 0 354 0 100%
 ```
 
 The file ends with `if __name__ == "__main__":  # pragma: no branch`. Coverage runs the file
@@ -609,34 +612,34 @@ arm is the only difference. No other line is excluded.
   documents only that the tool does not delete the replica's version. `--await-drain` does not
   assume a drain. At its limit it says UNKNOWN. It cannot tell a slow drain from versions that
   stay for good.
-- **Findings of review round 3 (commit bfc9d86).** The list of findings is not kept in the
-  repository, so this README cannot prove that each one is fixed. The round 3 findings of
-  bfc9d86 were not kept, so only the repros that survive were re-run: short target names that
-  resolve two datasets to one layer exit 2 with no `applyEdits` request, and a replica item in
-  the default namespace gives exit 1 and "ANCHOR WITHOUT A REPLICA ITEM". All 230 assertions
-  that the self-test of that commit printed are still printed, with the same text, by the
-  current one.
+- **The findings of an earlier review round were not recorded**, so this README cannot prove
+  that each one is fixed. Two repros survive and are pinned: short target names that resolve two
+  datasets to one layer exit 2 with no `applyEdits` request, and a replica item in the default
+  namespace gives exit 1 and "ANCHOR WITHOUT A REPLICA ITEM". Of the 230 assertions that the
+  self-test of that commit printed, 228 are printed again with the same text. Two changed on
+  purpose, because a run after `--apply` now exits 1.
 - **Two Esri sources were read from archived copies, not live pages.** They are the technical
   article and the 10.1 system tables page. The live support site refused a fetch on 2026-11-11
   (HTTP 403), so the quotes from the technical article were not re-checked on that date.
 - **The mutation sweeps and the similar-tool search cannot be repeated from this repository.**
   The sweeps were run by scripts that are not here. The search for similar tools was last run
   on 2026-10-12, before `--await-drain` was added.
-- **The round 3 findings were not kept**, so the fixes were confirmed from the commit diff and
-  the 230 surviving assertions, not from the original list.
 - **The mutation counts of the earlier sweeps come from scripts that are not shipped** and cannot
   be re-checked. Of the 13 drain mutations, 6 were re-run later and the self-test killed all 6.
+- **After a failed read followed by good reads, the report still prints the failed read.** The
+  line "The last failed read said" can be stale. It does not change a verdict.
+- **A write error on the `--report` file after the edits** ends the run with exit 2 and prints
+  no plan. Check the service, not the report, to see what was edited.
 - **A real wait needs an external export loop**, which this repository does not ship. The
   self-test refreshes the exports with a thread on the real clock.
-- **After `--apply`, exit 0 does not mean a replica moved.** The export the tool read cannot show
-  a later generation, so a replica repaired in this run stops being a finding on the word of the
-  service and the edit date alone. Export again after the next sync.
+- **After `--apply`, the run exits 1 until a later export shows the move.** The export the tool
+  read cannot show a later generation, so a replica whose edit was applied stays a finding.
+  Export again after the next sync. A scheduler that runs `--apply` sees exit 1 on the run that
+  made the edit, and exit 0 only after an export in which the generation moved.
 - **During `--apply`, phase two goes on after one failure.** A failed re-read or write marks that
   edit FAILED and the later edits are still written. The run then exits 2.
 - **`--accept-empty-replicas` is an assertion by the operator** that the replicas export was
   whole. With it, a replica whose `SYNC_` versions are also gone reads DRAINED.
-- **A field name returned by the service is printed as received**, so a hostile service could
-  forge report lines. The service you name is trusted.
 - **Check the hosts in your targets file before `--apply`.** The token is sent to every https
   host named there.
 - **Name a new file for `--report`.** An existing file at that path is overwritten without a
@@ -654,7 +657,6 @@ arm is the only difference. No other line is excluded.
 - **Any replica item that is not a `GPReplica` or a `GPSyncReplica` makes a gone id BLIND.**
   An estate that holds such an item never reaches DRAINED. It stays safe, exit 1, but may be
   unusable there.
-- **Field names that the service returns are printed as received.**
 - **A drain run exits 1 for a mistyped id (UNSEEN) and for a timeout (UNKNOWN) alike.** A
   script must read the output to tell them apart.
 - **`--await-drain` cannot refresh an export.** It reads two files. If nothing rewrites them,
@@ -677,7 +679,7 @@ arm is the only difference. No other line is excluded.
 - **The wait is not tested against a slow real export.** The real-clock tests use files that
   another thread of the self-test rewrites. A real `psql` loop was not run for this feature.
   The same SELECTs were run against PostgreSQL on 2026-10-12.
-- **The self-test spends about 1 second in real waits.** A very slow machine can fail the
+- **The self-test spends part of its time in real waits.** A very slow machine can fail the
   assertion that a refresh at 0.4 seconds ends the wait inside its 20-second limit.
 - **The core claim is an observation.** The logs are not published. Esri documents the need to
   synchronize regularly, not the case of an idle layer.
@@ -707,9 +709,7 @@ arm is the only difference. No other line is excluded.
   millisecond, or a number with more digits than JSON keeps, could change.
 - **The tool does not know that an edit moved the replica.** It checks that the service accepted
   the edit and, with editor tracking, that the row's edit date moved. Whether the replica's
-  generation moves is visible only in a later export. Exit 0 after `--apply` means the service
-  accepted the edits, not that any replica moved. A scheduler sees green on the run that made
-  the edit.
+  generation moves is visible only in a later export, so the run that made the edit exits 1.
 - **Editor tracking.** Esri's pages do not say that every edit restamps the tracking fields. The
   tool reads the edit date back and reports a layer where it did not move as a failure. On a
   layer without editor tracking the edit cannot be checked. It is reported as `UNVERIFIED`,
@@ -718,7 +718,9 @@ arm is the only difference. No other line is excluded.
   the one field is rewritten. The tool cannot see this.
 - **Branch versioned layers are refused**, and the tool edits only the version a service is
   published against. A feature service that is not the data in the replica's scope would edit
-  the wrong place. The targets file is your decision.
+  the wrong place. The targets file is your decision. The tool checks only that the layer's
+  `name` fits the dataset or the row's `layer_name`. A layer that has the right name and holds
+  other data passes.
 - **The lowest OBJECTID comes from a list of object IDs.** Esri limits that list to one million
   IDs. On a larger layer the row is the lowest one returned, which still satisfies the filter.
 - **A `where` clause is the replica's filter, sent as written.** It must use field names that
@@ -737,9 +739,10 @@ arm is the only difference. No other line is excluded.
 - **The targets file decides where the token is sent.** There is no allowlist of hosts. Keep
   the file under the same control as the token.
 - **Keep tokens out of the path of a target URL.** Only a query string, a fragment or a login
-  is detected. A token in the path is printed in the plan.
-- **The header is `X-Esri-Authorization`.** Esri documents it, and says header tokens are
-  supported from ArcGIS Server 10.5.1. The tool sends no other header. A service that accepts
+  is detected. A token in the path is printed in the plan. A path parameter after a semicolon
+  is part of the path, so a secret placed there is printed like one in the path.
+- **The header is `X-Esri-Authorization`.** Esri documents it. The Esri page also says header
+  tokens are supported from ArcGIS Server 10.5.1, and does not tie that note to this header. The tool sends no other header. A service that accepts
   only the standard `Authorization` header will refuse every request.
 - **A request to this machine ignores the proxy settings of the environment.** A request to
   an https host still uses `HTTPS_PROXY` and `NO_PROXY`, so the token goes to that proxy. A

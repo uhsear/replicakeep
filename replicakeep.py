@@ -153,7 +153,7 @@ COUNTED = ("versions", "replicas", "replica_log")
 ROW_COUNT = "row_count"
 EXPORTED_AT = "exported_at"
 KNOWN_COLUMNS = set(c for cols in REQUIRED.values() for c in cols) | set(
-    [ROW_COUNT, EXPORTED_AT])
+    [ROW_COUNT, EXPORTED_AT, "layer_name"])
 
 
 class InputError(Exception):
@@ -504,27 +504,39 @@ def analyse(model, min_idle_days=DEFAULT_MIN_IDLE_DAYS,
             "as_of": as_of, "unread": model["unread"], "odd": model["odd"]}
 
 
-def resolve_target(dataset, targets):
-    """The layer URL for a dataset name, or None unless exactly one matches.
+def names_match(dataset, name):
+    """True when name is the dataset in full or its trailing name parts.
 
-    A target names the dataset in full or by its trailing parts, so
-    OWNER.TABLE and TABLE both match DB.OWNER.TABLE.
+    OWNER.TABLE and TABLE both match DB.OWNER.TABLE, whatever the case.
     """
-    d = dataset.upper()
-    hits = [t for t in targets if d == clean(t["dataset"]).upper()
-            or d.endswith("." + clean(t["dataset"]).upper())]
-    return clean(hits[0]["layer_url"]) if len(hits) == 1 else None
+    d, n = dataset.upper(), name.upper()
+    return d == n or d.endswith("." + n)
 
 
-def gate(report, exit_on, repaired=()):
+def match_target(dataset, targets):
+    """The one --targets row for a dataset name, or None unless one matches."""
+    hits = [t for t in targets if names_match(dataset, clean(t["dataset"]))]
+    return hits[0] if len(hits) == 1 else None
+
+
+def resolve_target(dataset, targets):
+    """The layer URL for a dataset name, or None unless exactly one matches."""
+    row = match_target(dataset, targets)
+    return clean(row["layer_url"]) if row else None
+
+
+def gate(report, exit_on):
     """The exit code. Exit 2 is decided elsewhere and wins over this.
+
+    A replica stays a finding after its edit was applied. The exports the tool
+    read cannot show that its generation moved, and only a later export can.
 
     Besides replicas, a finding is a version name that looks like an anchor
     and matches no pattern, and an anchor whose replica item is missing while
     another item could not be read.
     """
     found = [v for v in report["verdicts"]
-             if v["status"] in (IDLE, COVERED) and v["id"] not in repaired
+             if v["status"] in (IDLE, COVERED)
              or v["status"] in UNJUDGED]
     if exit_on == "never":
         return 0
@@ -810,7 +822,7 @@ def call(url, params, token, post=True):
                          % MAX_RESPONSE_BYTES)
     try:
         data = json.loads(raw.decode("utf-8"))
-    except ValueError:
+    except (ValueError, RecursionError):
         raise ApplyError("the response is not JSON.")
     if not isinstance(data, dict):
         raise ApplyError("the response is not a JSON object.")
@@ -850,6 +862,15 @@ def preflight(edit, token):
         raise ApplyError("a target must be a feature service layer URL, "
                          "ending in /FeatureServer/<number>.")
     info = call(url, {"f": "json"}, token, post=False)
+    # A hand-written targets row can point a dataset at another table. The
+    # layer must carry the dataset's name, or the name the row gives it.
+    name, given = clean(info.get("name")), edit.get("layer_name")
+    if not name or not (name.upper() == given.upper() if given
+                        else names_match(edit["dataset"], name)):
+        raise ApplyError("the layer is named '%s', which is not the dataset "
+                         "%s. Check the layer URL. If it is right, give the "
+                         "name the service uses in a layer_name column of the "
+                         "targets file." % (name[:80], clean(edit["dataset"])))
     caps = [c.strip().lower() for c in str(info.get("capabilities")).split(",")]
     if "update" not in caps:
         raise ApplyError("the layer does not list Update in its "
@@ -1077,8 +1098,8 @@ def _parse(argv):
                          "exported_at time in the versions export")
     ap.add_argument("--exit-on", dest="exit_on", choices=EXIT_ON,
                     help="what makes the exit code 1: idle (default: an idle "
-                         "replica not repaired, or one that cannot be judged "
-                         "or moved by an edit), any (also an anchor with no "
+                         "replica, edited or not, or one that cannot be "
+                         "judged or moved by an edit), any (also an anchor with no "
                          "replica item), or never. A failure is exit 2 "
                          "either way.")
     ap.add_argument("--report", help="write the report to this file")
@@ -1193,8 +1214,10 @@ def _main(args):
         return fail(clean(exc))
     for e in report["edits"]:
         e["target"] = resolve_target(e["dataset"], targets)
+        e["layer_name"] = clean((match_target(e["dataset"], targets)
+                                 or {}).get("layer_name"))
 
-    applied, failed, repaired, handle = None, False, set(), None
+    applied, failed, handle = None, False, None
     if args.apply:
         # Open the report first. A report that cannot be written must stop
         # the run before the first edit, not after the last.
@@ -1205,9 +1228,6 @@ def _main(args):
     try:
         if args.apply:
             applied, failed = apply_plan(report, token, args.max_edits)
-            for e in report["edits"]:
-                if applied[e["replica"]].startswith("APPLIED"):
-                    repaired.update(e["covers"])
         lines = describe(report, args.min_idle_days, applied, args.apply)
         if args.apply:
             handle.write("\n".join(lines) + "\n")
@@ -1226,7 +1246,7 @@ def _main(args):
     if failed:
         return fail("an edit was refused or could not be checked. Read the "
                     "report.")
-    return gate(report, args.exit_on or "idle", repaired)
+    return gate(report, args.exit_on or "idle")
 
 
 def drain_main(args, given, clock=time.monotonic, sleep=time.sleep):
@@ -1465,7 +1485,7 @@ class Stub(object):
         return layer["info"]
 
     def add(self, name, tracking=True, **info):
-        meta = {"capabilities": "Query,Update,Editing",
+        meta = {"name": name, "capabilities": "Query,Update,Editing",
                 "fields": [
                     {"name": "OBJECTID", "type": "esriFieldTypeOID",
                      "editable": True},
@@ -1781,8 +1801,7 @@ def self_test():
             103, "c", target=odd, datasets=[(PLANTS, FEATURE, "")])
         found = dict((v["id"], v) for v in analyse(build(**typed))["verdicts"])
         check(found[103]["status"] == NO_TYPE and found[103]["edit"] is None
-              and gate(analyse(build(**typed)), "idle", repaired=set(
-                  [101, 102, 104, 106, 107, 108])) == 1,
+              and gate(analyse(build(**typed)), "idle") == 1,
               "a replica whose TargetType is %r is NO_TYPE and a finding, "
               "not a client and not a clean exit  <-- pinned defect"
               % odd)
@@ -1849,9 +1868,9 @@ def self_test():
     check((gate(report, "idle"), gate(report, "any"), gate(report, "never"))
           == (1, 1, 0), "gate: idle and any find the plan, never does not")
     four = analyse(model, only=set([101, 102, 103, 104]))
-    check((gate(four, "idle"), gate(four, "idle", repaired=set(
-        [101, 102, 103, 104]))) == (1, 0),
-          "a replica whose edit was applied is no longer a finding")
+    check(gate(four, "idle") == 1,
+          "gate takes no list of repaired replicas: an idle replica is a "
+          "finding until a later export shows it moved  <-- pinned defect")
     quiet = analyse(model, only=set([109]))
     check(gate(quiet, "idle") == 0, "nothing idle is exit 0")
     quiet["detached"], quiet["unread"] = [77], 0
@@ -2166,8 +2185,7 @@ def self_test():
             return stub
 
         def apply_args(extra=(), full=False):
-            # Unless full, only the four idle replicas are in the run, so a
-            # repaired run is exit 0 and not 1 for the three left unjudged.
+            # Unless full, only the four idle replicas are in the run.
             return argv + ["--targets", path("tg2.csv"), "--report",
                            path("rep.txt"), "--apply"] + (
                 [] if full else ["--only", "101,102,103,104"]) + list(extra)
@@ -2189,11 +2207,12 @@ def self_test():
         code, out, err, text = go(stub)
         sent = writes(stub)
         updates = [json.loads(r["params"]["updates"]) for r in sent]
-        check(code == 0 and text.count("APPLIED") == 3
+        check(code == 1 and text.count("APPLIED") == 3
               and "VERDICT: 4 idle replica(s)" in text
               and "Every edit was made and checked" in text,
               "--apply makes the three planned edits, reports them, and "
-              "exits 0 because every idle replica was repaired")
+              "exits 1 because no export yet shows a replica moved  "
+              "<-- pinned defect")
         check(all(r["token"] == "Bearer " + secret for r in stub.requests),
               "every request carries the token in the X-Esri-Authorization "
               "header")
@@ -2257,7 +2276,7 @@ def self_test():
         for ending in ("\r\n", "\n", "  "):
             stub = setup()
             code, out, err, text = go(stub, env=secret + ending)
-            check(code == 0 and all(r["token"] == "Bearer " + secret
+            check(code == 1 and all(r["token"] == "Bearer " + secret
                                     for r in stub.requests),
                   "a token with %r after it is trimmed, not rejected  "
                   "<-- pinned defect" % ending)
@@ -2401,6 +2420,10 @@ def self_test():
                 {"0": (status, body, list(headers))})
 
         mutations = (
+            ("a layer with another name",
+             lambda layer: layer["info"].update(name="ponds")),
+            ("a layer with no name",
+             lambda layer: layer["info"].pop("name")),
             ("no Update capability",
              lambda layer: layer["info"].update(capabilities="Query")),
             ("a branch versioned layer",
@@ -2417,6 +2440,8 @@ def self_test():
             ("an HTTP 500", raw(500, b"x")),
             ("a body that is not JSON", raw(200, b"nope")),
             ("a body that is a JSON array", raw(200, b"[1]")),
+            ("a body nested far past the recursion limit",
+             raw(200, b"[" * 100000)),
             ("an error body with a code",
              raw(200, b'{"error": {"code": 498, "message": "Invalid"}}')),
             ("an error body that is not an object",
@@ -2431,6 +2456,33 @@ def self_test():
                   and "replica 104" in text and secret not in out + err + text,
                   "%s stops the run before the first write  "
                   "<-- pinned defect" % label)
+
+        base = "/arcgis/rest/services/%s/FeatureServer/0"
+        stub = setup()
+        put("tg2.csv", "dataset,layer_url\nOWNER.PLANTS,%s\nROADS,%s\n"
+            % (stub.base + base % "roads", stub.base + base % "plants"))
+        code, out, err, text = go(stub)
+        check(code == 2 and not writes(stub) and "is not the dataset" in err
+              and "refused before any edit" in text,
+              "a dataset pointed at the layer of another dataset stops the "
+              "run before the first write  <-- pinned defect")
+        stub = setup()
+        stub.layer("roads")["info"]["name"] = "Road Centerlines"
+        put("tg2.csv", "dataset,layer_url,layer_name\nOWNER.PLANTS,%s,\n"
+            "ROADS,%s,road centerlines\n"
+            % (stub.base + base % "plants", stub.base + base % "roads"))
+        code, out, err, text = go(stub)
+        check(code == 1 and len(writes(stub)) == 3,
+              "a layer_name column names a layer that the service titles "
+              "differently, and its edit is made")
+        stub = setup()
+        put("tg2.csv", "dataset,layer_url,layer_name\nOWNER.PLANTS,%s,\n"
+            "ROADS,%s,Road Centerlines\n"
+            % (stub.base + base % "plants", stub.base + base % "roads"))
+        code, out, err, text = go(stub)
+        check(code == 2 and not writes(stub) and "layer_name column" in err,
+              "a layer_name that the layer does not carry stops the run "
+              "before the first write  <-- pinned defect")
 
         stub = setup()
         stub.layer("roads")["raw"]["0"] = (302, b"", [
@@ -2901,7 +2953,7 @@ def self_test():
             [sys.executable, script] + apply_args(), env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stub.close()
-        check(done.returncode == 0 and len(writes(stub)) == 3
+        check(done.returncode == 1 and len(writes(stub)) == 3
               and secret.encode() not in done.stdout + done.stderr
               and all(r["token"] == "Bearer " + secret
                       for r in stub.requests),
@@ -2914,7 +2966,7 @@ def self_test():
             [sys.executable, script] + apply_args(), env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stub.close()
-        check(done.returncode == 0 and len(writes(stub)) == 3
+        check(done.returncode == 1 and len(writes(stub)) == 3
               and all(r["token"] == "Bearer " + secret
                       for r in stub.requests),
               "a request to this machine ignores HTTP_PROXY, so the token "

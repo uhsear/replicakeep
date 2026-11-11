@@ -94,10 +94,10 @@ PASS  --exit-on never cannot turn an UNKNOWN into exit 0  <-- pinned defect
 ...
 PASS  the real clock: an export nobody refreshes ends at the timeout as UNKNOWN, exit 1  <-- pinned defect
 ...
-280 assertions, 0 failed
+287 assertions, 0 failed
 ```
 
-The block above is a real run, cut to 29 of its 280 PASS lines. Each line is verbatim, and
+The block above is a real run, cut to 29 of its 287 PASS lines. Each line is verbatim, and
 `...` marks the lines left out.
 
 The second half of the same trouble is the end of a replica that is abandoned. A replica that
@@ -150,7 +150,7 @@ exists.
 Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-party package.
 The tool reads files, and under `--apply` it calls a feature service over HTTP.
 
-The same 280 assertions pass on Windows (Python 3.13.2), on Windows (Python 3.9.25) and on
+The same 287 assertions pass on Windows (Python 3.13.2), on Windows (Python 3.9.25) and on
 Ubuntu 24.04 (Python 3.12.3). The output is identical on all three apart from line endings. The
 self-test takes about 7 seconds on Windows, and about 1 second of those is real waits of the
 drain tests. Branch coverage of `replicakeep.py` is 100 percent with one
@@ -200,8 +200,9 @@ ASCII, and it does not print the value.
 | `--exit-on` | `idle` | What makes the exit code 1: `idle`, `any` or `never`. See "Exit codes". |
 | `--report` | off | Write the report to this file. Needs `--apply`. The file is overwritten. |
 | `--apply` | off | Make the edits, and write `--report`. Needs `--targets` and `--report`. |
-| `--await-drain` | off | Replica ids, comma separated, that you just unregistered. Re-read `--versions` and `--replicas` until nothing of them is left, or until `--drain-timeout`. Needs `--versions` and `--replicas`. Takes no other flag but the three below. Writes nothing and opens no connection. |
+| `--await-drain` | off | Replica ids, comma separated, that you just unregistered. Re-read `--versions` and `--replicas` until nothing of them is left, or until `--drain-timeout`. Needs `--versions` and `--replicas`. Takes no other flag but the four below. Writes nothing and opens no connection. |
 | `--before-replicas` | none | With `--await-drain`: a replicas export taken before the unregister. It proves that each id was registered. |
+| `--accept-empty-replicas` | off | With `--await-drain`: accept a replicas export that holds a header and no row as proof that nothing is registered. Without it, such an export gives `EMPTY_EXPORT` and never `DRAINED`, because a failed export looks the same. |
 | `--poll-seconds` | `30` | With `--await-drain`: seconds between two reads. Above 0 and at most 86400. |
 | `--drain-timeout` | `1800` | With `--await-drain`: stop waiting after this many seconds, and report UNKNOWN. 0 is one look. At most 86400. |
 | `--self-test` | off | Run the offline assertions and exit. Takes no other flag. |
@@ -388,17 +389,24 @@ read exits 2.
 
 | Status | When | Counts as drained |
 |---|---|---|
-| `DRAINED` | No replica item and no `SYNC_` version of the id is in the last export, and the id was seen registered or anchored by a reading, or is in `--before-replicas`. | Yes. The only one. |
+| `DRAINED` | No replica item and no `SYNC_` version of the id is in the last export, the id was seen registered or anchored by a reading or is in `--before-replicas`, and the replicas export holds a row or `--accept-empty-replicas` was given. | Yes. The only one. |
 | `NOT_UNREGISTERED` | The replica item is still in the replicas export. The unregister has not run, or has not taken effect. | No |
 | `ANCHORS_REMAIN` | The item is gone, and at least one `SYNC_` version of the id is still in the versions export. | No |
 | `UNSEEN` | Nothing of the id is in the exports, and nothing showed it registered. A mistyped id reads the same as a drained one. Pass `--before-replicas`. | No |
+| `EMPTY_EXPORT` | Nothing of the id is in the exports and it was seen registered, but the replicas export holds no row at all, and `--accept-empty-replicas` was not given. | No |
 | `BLIND` | Nothing of the id is in the exports, but a version name that holds `SYNC_` and fits no anchor pattern, or a replica item that could not be read, may own it. A `GPSyncReplica` item is not such an item: it is read for its ID, and one with no usable ID owns nothing. | No |
 
 The verdict is `DRAINED` only when every id is DRAINED. In every other case it is `UNKNOWN`, and
 the exit code is 1. The tool does not call a timeout a failure of the geodatabase or a success
 of the unregister. It says only that the evidence did not arrive. An empty replicas export
-(a header and no row) is a reading with no items: the last replica to be unregistered leaves it
-so. An empty versions export is refused, because `sde_versions` always holds `DEFAULT`, and
+(a header and no row) is a reading with no items. The last replica to be unregistered leaves it
+so, and so does an export that failed or ran against the wrong database, and nothing in the file
+tells these apart. Without `--accept-empty-replicas` such an export gives `EMPTY_EXPORT`, never
+`DRAINED`. Check that the replicas SELECT ran against the right database, then pass the flag.
+The flag lifts nothing else: an id with a `SYNC_` version, an unreadable item or no proof of
+registration keeps its own status. No Esri page says that the last unregister leaves no row.
+That is an observation of one estate, not a rule.
+An empty versions export is refused, because `sde_versions` always holds `DEFAULT`, and
 read as no versions it would call every id drained. If `--before-replicas` does not show an id, only a reading that shows it registered or
 anchored can make it DRAINED.
 
@@ -409,7 +417,7 @@ A real run, on synthetic exports that another process rewrote after about three 
 exports hold two replicas, 56 and 57, with two anchors each:
 
 ```
-$ python replicakeep.py --await-drain 56,57 --versions versions.csv --replicas replicas.csv --before-replicas before_replicas.csv --poll-seconds 2 --drain-timeout 20
+$ python replicakeep.py --await-drain 56,57 --versions versions.csv --replicas replicas.csv --before-replicas before_replicas.csv --accept-empty-replicas --poll-seconds 2 --drain-timeout 20
 replicakeep: wait for unregistered replica(s) to drain
 This tool never unregisters. It reads the exports that you refresh, and says what is left of each replica.
 
@@ -431,7 +439,7 @@ This tool never unregisters. It reads the exports that you refresh, and says wha
 ANCHORS_REMAIN   replica 56: the replica item is gone, but 2 SYNC_ version(s) of it are still in the versions export
 ANCHORS_REMAIN   replica 57: the replica item is gone, but 2 SYNC_ version(s) of it are still in the versions export
 
-1 fresh export(s) read in 5 s, the last taken at 2026-03-31 12:05:00; 3 read(s) ignored because exported_at did not advance.
+1 fresh export(s) read in 5 s, the last taken at 2026-03-31 12:00:00; 3 read(s) ignored because exported_at did not advance.
 VERDICT: UNKNOWN: 2 of 2 replica(s) are not confirmed drained when the wait ended. This is not a success. Esri says Unregister Replica does not delete a replica's version, and says nothing of what becomes of its SYNC_ versions. If they never drain, compressfloor --unregister-plan lists them in drop order.
 exit 1
 ```
@@ -554,6 +562,7 @@ plan again. A replica whose generation moved is `ACTIVE` in that second plan.
 | A version name or item that could not be read makes a gone id BLIND | Self-test, through `drain_verdicts` and `drain_reading`. |
 | A read that fails after the first is survived, a failed first read exits 2 | Self-test: a scripted `InputError` and `OSError`, and a missing file through the command line. |
 | An empty versions export is refused, an empty replicas export is a reading | Self-test, through `drain_reading`. |
+| An empty replicas export never gives DRAINED unless `--accept-empty-replicas` is given | Self-test: `drain_verdicts` and `wait_drain` with and without the flag, and the command line on a header-only file with and without it. The flag lifts no other status. |
 | `--exit-on`, `--apply`, `--report` and the plan flags are refused with `--await-drain` | Self-test, through the command line. |
 | A poll of 0 or less, a timeout below 0, `nan` or `inf` is refused | Self-test, through the command line. |
 | The idle-replica plan still gives the same verdicts after `build` was split into helpers | Self-test: all 230 earlier assertions are unchanged. |
@@ -580,7 +589,7 @@ the self-test.
 ```
 python -m coverage run --branch replicakeep.py --self-test
 python -m coverage report -m
-replicakeep.py 1376 0 354 0 100%
+replicakeep.py 1392 0 356 0 100%
 ```
 
 The file ends with `if __name__ == "__main__":  # pragma: no branch`. Coverage runs the file
@@ -595,8 +604,12 @@ arm is the only difference. No other line is excluded.
   assume a drain. At its limit it says UNKNOWN. It cannot tell a slow drain from versions that
   stay for good.
 - **Findings of review round 3 (commit bfc9d86).** The list of findings is not kept in the
-  repository, so this README cannot prove that each one is fixed. All 230 assertions that the
-  self-test of that commit printed are still printed, with the same text, by the current one.
+  repository, so this README cannot prove that each one is fixed. The round 3 findings of
+  bfc9d86 were not kept, so only the repros that survive were re-run: short target names that
+  resolve two datasets to one layer exit 2 with no `applyEdits` request, and a replica item in
+  the default namespace gives exit 1 and "ANCHOR WITHOUT A REPLICA ITEM". All 230 assertions
+  that the self-test of that commit printed are still printed, with the same text, by the
+  current one.
 - **Two Esri sources were read from archived copies, not live pages.** They are the technical
   article and the 10.1 system tables page.
 - **The mutation sweeps and the similar-tool search cannot be repeated from this repository.**
@@ -621,9 +634,17 @@ arm is the only difference. No other line is excluded.
 - **`--await-drain` cannot refresh an export.** It reads two files. If nothing rewrites them,
   it reads one fresh export, waits, and ends UNKNOWN. The report counts the reads it ignored.
 - **A replicas export that is empty because it failed reads as no items.** A zero-byte file is
-  refused, but a file that holds only its header is a valid answer after the last unregister.
-  A failed export that leaves a header could hide a replica that is still registered. The id is
-  then DRAINED only if its `SYNC_` versions are gone from the versions export too.
+  refused, but a file that holds only its header reads as no items. Without
+  `--accept-empty-replicas` that gives `EMPTY_EXPORT`, exit 1. With the flag, a failed export
+  that leaves a header could hide a replica that is still registered. The id is then DRAINED
+  only if its `SYNC_` versions are gone from the versions export too.
+- **A JSON replicas export of `[]` reads like a header-only CSV,** as no items, so a failed
+  export that writes `[]` gets the same `EMPTY_EXPORT` treatment, and the same risk when the
+  flag is given.
+- **The tool cannot refresh the exports itself.** A real wait needs a scheduled export loop
+  that this repository does not ship.
+- **A replica that finishes its unregister before the first read is reported UNKNOWN after the
+  full drain timeout** unless `--before-replicas` is given.
 - **The drain check looks at replica ids, not at states.** A replica with no `SYNC_` version and
   no item is DRAINED. Whether the compress then folds more is for compressfloor and a later
   export to show.
@@ -772,7 +793,7 @@ arm is the only difference. No other line is excluded.
   it. Point `--targets` only at a service that you trust.
 - **The replicas export has no timestamp.** Only the versions export's `exported_at` is checked
   for freshness. A stale replicas export can add evidence that a replica is not drained, but
-  it cannot add evidence that one is, except for the header-only case above.
+  it cannot add evidence that one is.
 - **The self-test writes temporary files and binds a local HTTP stub.** It writes nothing in
   the repository and makes no request to any other host. The tool itself writes only under
   `--apply`.
@@ -820,12 +841,13 @@ arm is the only difference. No other line is excluded.
   in case, and which resolve to one layer, are not refused by that check. Removing its
   `.upper()` leaves the self-test green. No assertion pins it.
 - **`--await-drain` trusts the first reading as fresh.** Later reads count only if the versions
-  export's `exported_at` advances. The replicas export's `exported_at` is never checked. If
+  export's `exported_at` advances. The replicas export has no timestamp, so it is not checked
+  for freshness. If
   `versions.csv` is refreshed and `replicas.csv` stays stale, the stale file still shows the
   item, so the id stays NOT_UNREGISTERED. That is the safe direction. Refresh both files.
-- **An empty replicas export is trusted as written.** Check that the replicas SELECT ran against
-  the right database before you act on DRAINED. A header-only file has no row to carry
-  `row_count`, so a cut export cannot be caught.
+- **An accepted empty replicas export is trusted as written.** With `--accept-empty-replicas`,
+  check that the replicas SELECT ran against the right database before you act on DRAINED. A
+  header-only file has no row to carry `row_count`, so a cut export cannot be caught.
 - **A CSV in UTF-16**, which `sqlcmd` can write by default, fails the UTF-8 read and exits 2 with
   the codec message. Write the export as UTF-8.
 - **An `--apply` run with no planned edit still writes the `--report` file.** Its closing line
@@ -833,6 +855,15 @@ arm is the only difference. No other line is excluded.
 - **The report is plain text, not CSV.** Do not paste it into a spreadsheet as cells. A replica
   name that starts with `=`, `+`, `-` or `@` is not neutralised.
 - **Extremely nested JSON or XML exits 2 with a bare exception name.**
+- **A SQL Server `datetimeoffset` value such as `2026-03-31 12:00:00.0000000 +00:00`** (a space
+  before the offset) in `exported_at` or `logdate` exits 2 as not a `YYYY-MM-DD HH:MM:SS`
+  timestamp. Cast the column to `datetime2`, or use an offset with no space, before you export.
+- **`--self-test` exits 1 when an assertion fails,** the code the tool also uses for findings.
+  Run it on its own and read the footer line.
+- **A reader that closes the pipe early,** such as `| head -3`, makes `main()` exit 2 with a
+  message on stderr. Under `--apply` the edits and the report file are already done by then.
+- **Some README counts were spot-checked only.** Fourteen layer and row faults, five bad update
+  responses and the quoted PASS lines were sampled, and the other counts were not re-verified.
 - **State locks are not visible.** A connected session's lock on an old state can hold compress
   too, and no export shows it.
 - **The XML parser is the standard library's.** A definition with a DTD or an entity is refused

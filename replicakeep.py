@@ -135,6 +135,7 @@ NOT_UNREGISTERED = "NOT_UNREGISTERED"
 ANCHORS_REMAIN = "ANCHORS_REMAIN"
 UNSEEN = "UNSEEN"
 BLIND = "BLIND"
+EMPTY_EXPORT = "EMPTY_EXPORT"
 READ_FAILURES = (IOError, OSError, ValueError, csv.Error)
 # Anchors held, and no edit moves them or the tool could not judge. A clean
 # exit here would be the false green this tool exists to end.
@@ -622,9 +623,10 @@ def drain_reading(versions, replicas):
     items that parsed, anchors the replica ids that hold SYNC_ versions, and
     blind the count of things that could hide an owner: a version name that
     holds SYNC_ and fits no pattern, and a replica item that did not parse.
-    An empty replicas export is allowed here. The last replica to be
-    unregistered leaves the export with a header and no row. An empty
-    versions export is refused, because sde_versions always holds DEFAULT.
+    An empty replicas export is allowed here, and is flagged: it is what the
+    last unregister leaves, and also what a failed or wrong-database export
+    leaves, and nothing in it tells them apart. An empty versions export is
+    refused, because sde_versions always holds DEFAULT.
     """
     if not versions:
         raise InputError("the versions export is empty. A failed export "
@@ -635,14 +637,16 @@ def drain_reading(versions, replicas):
     items, unread = read_items(replicas, syncs)
     return {"at": read_clock(versions), "anchors": anchors,
             "items": set(r["id"] for r in items) | syncs,
-            "blind": odd + unread}
+            "blind": odd + unread, "empty": not replicas}
 
 
-def drain_verdicts(ids, reading, proved):
+def drain_verdicts(ids, reading, proved, accept_empty=False):
     """One verdict per id: (id, status, detail). proved holds the ids that
     some reading, or the --before-replicas export, showed as registered or
     anchored. Without that proof an id with nothing left is UNSEEN, because a
-    mistyped id reads the same as a drained one."""
+    mistyped id reads the same as a drained one. A replicas export with no
+    row cannot be told from a failed export, so it gives DRAINED only when
+    accept_empty says the operator checked it."""
     out = []
     for rid in sorted(ids):
         held = len(reading["anchors"].get(rid, []))
@@ -664,13 +668,20 @@ def drain_verdicts(ids, reading, proved):
                         "this run never saw it registered, so a mistyped id "
                         "reads the same. Pass the replicas export taken "
                         "before the unregister as --before-replicas"))
+        elif reading["empty"] and not accept_empty:
+            out.append((rid, EMPTY_EXPORT, "nothing of it is in the exports, "
+                        "but the replicas export holds no row at all. The "
+                        "last unregister leaves that, and so does a failed "
+                        "export or one from the wrong database. Check the "
+                        "export, then pass --accept-empty-replicas"))
         else:
             out.append((rid, DRAINED, "no replica item and no SYNC_ version "
                         "of it in the export"))
     return out
 
 
-def wait_drain(read, ids, proved, poll, timeout, clock, sleep):
+def wait_drain(read, ids, proved, poll, timeout, clock, sleep,
+               accept_empty=False):
     """Read until every id is DRAINED or the time budget ends.
 
     Returns (verdicts, info). read() gives one reading and may raise. A
@@ -697,7 +708,7 @@ def wait_drain(read, ids, proved, poll, timeout, clock, sleep):
                           or i in new["anchors"])
         elif new is not None:
             info["ignored"] += 1
-        verdicts = drain_verdicts(ids, reading, proved)
+        verdicts = drain_verdicts(ids, reading, proved, accept_empty)
         left = timeout - (clock() - start)
         if left <= 0 or all(v[1] == DRAINED for v in verdicts):
             info["waited"], info["at"] = clock() - start, reading["at"]
@@ -1070,6 +1081,13 @@ def _parse(argv):
     ap.add_argument("--before-replicas", dest="before_replicas",
                     help="with --await-drain: a replicas export taken before "
                          "the unregister, to prove each id was registered")
+    ap.add_argument("--accept-empty-replicas", dest="accept_empty_replicas",
+                    action="store_true",
+                    help="with --await-drain: accept a replicas export with "
+                         "a header and no row as proof that nothing is "
+                         "registered. Without it such an export never "
+                         "gives DRAINED, because a failed export looks the "
+                         "same.")
     ap.add_argument("--poll-seconds", dest="poll_seconds", type=float,
                     help="with --await-drain: seconds between reads "
                          "(default %d)" % DEFAULT_POLL_SECONDS)
@@ -1107,7 +1125,9 @@ def _main(args):
                          "max_edits", "as_of", "exit_on", "report",
                          "await_drain", "before_replicas", "poll_seconds",
                          "drain_timeout")
-             if getattr(args, k) is not None] + ["apply"] * args.apply
+             if getattr(args, k) is not None] + [
+                 "apply"] * args.apply + [
+                 "accept_empty_replicas"] * args.accept_empty_replicas
     if args.self_test:
         if given:
             return fail("--self-test takes no other flag.")
@@ -1115,7 +1135,8 @@ def _main(args):
     if args.await_drain is not None:
         return drain_main(args, given)
     waits = [k for k in ("before_replicas", "poll_seconds", "drain_timeout")
-             if getattr(args, k) is not None]
+             if getattr(args, k) is not None] + [
+                 "accept_empty_replicas"] * args.accept_empty_replicas
     if waits:
         return fail("--%s is read only with --await-drain."
                     % waits[0].replace("_", "-"))
@@ -1201,11 +1222,12 @@ def _main(args):
 def drain_main(args, given, clock=time.monotonic, sleep=time.sleep):
     """--await-drain: exit 0 only when every id is confirmed drained."""
     allowed = ("versions", "replicas", "await_drain", "before_replicas",
-               "poll_seconds", "drain_timeout")
+               "poll_seconds", "drain_timeout", "accept_empty_replicas")
     other = [k for k in given if k not in allowed]
     if other:
         return fail("--await-drain takes only --versions, --replicas, "
-                    "--before-replicas, --poll-seconds and --drain-timeout. "
+                    "--before-replicas, --accept-empty-replicas, --poll-seconds "
+                    "and --drain-timeout. "
                     "It writes nothing, so --apply, --report and the plan "
                     "flags do not apply.")
     absent = [k for k in ("versions", "replicas") if not getattr(args, k)]
@@ -1235,7 +1257,7 @@ def drain_main(args, given, clock=time.monotonic, sleep=time.sleep):
             return drain_reading(read_rows(args.versions, "versions"),
                                  read_rows(args.replicas, "replicas"))
         verdicts, info = wait_drain(read, ids, proved, poll, timeout, clock,
-                                    sleep)
+                                    sleep, args.accept_empty_replicas)
     except READ_FAILURES + (InputError,) as exc:
         return fail(clean(exc))
     for line in describe_drain(verdicts, info):
@@ -2474,9 +2496,9 @@ def self_test():
                   "give  <-- pinned defect" % name)
 
         # ---- the drain wait (--await-drain), over scripted readings
-        def rd(minute, items=(), held=(), blind=0):
+        def rd(minute, items=(), held=(), blind=0, empty=False):
             return {"at": AS_OF + datetime.timedelta(minutes=minute),
-                    "items": set(items), "blind": blind,
+                    "items": set(items), "blind": blind, "empty": empty,
                     "anchors": dict((i, ["SYNC_SEND_%d_3" % i])
                                     for i in held)}
 
@@ -2492,7 +2514,8 @@ def self_test():
                 return item
             return read
 
-        def waited(readings, ids=(5,), proved=(5,), poll=30, timeout=100):
+        def waited(readings, ids=(5,), proved=(5,), poll=30, timeout=100,
+                   accept=False):
             clock = [0.0]
             sleeps = []
 
@@ -2501,7 +2524,7 @@ def self_test():
                 clock[0] += seconds
             verdicts, info = wait_drain(scripted(readings), set(ids),
                                         set(proved), poll, timeout,
-                                        lambda: clock[0], sleep)
+                                        lambda: clock[0], sleep, accept)
             return verdicts, info, sleeps
 
         dr_fx = fixture()
@@ -2547,6 +2570,9 @@ def self_test():
         check("empty" in message(lambda: drain_reading([], dr_fx["replicas"])),
               "an empty versions export is refused, never read as every "
               "replica drained  <-- pinned defect")
+        check(drain_reading(dr_fx["versions"], [])["empty"]
+              and not dr["empty"],
+              "a drain reading says whether the replicas export held no row")
         raises(lambda: drain_reading(
             dr_fx["versions"], dr_fx["replicas"] * 2),
             "two items with one objectid are refused in a drain reading")
@@ -2562,6 +2588,27 @@ def self_test():
               "nothing left, but a version name or item that could not be "
               "read, is BLIND and not DRAINED  <-- pinned defect")
 
+        check(drain_verdicts([4], rd(0, empty=True), set([4]))[0][1]
+              == EMPTY_EXPORT
+              and drain_verdicts([4], rd(0, empty=True), set([4]),
+                                 True)[0][1] == DRAINED
+              and drain_verdicts([4], rd(0, empty=True), set())[0][1]
+              == UNSEEN
+              and drain_verdicts([4], rd(0, empty=True, blind=1), set([4]),
+                                 True)[0][1] == BLIND
+              and drain_verdicts([4], rd(0, empty=True, held=[4]),
+                                 set([4]), True)[0][1] == ANCHORS_REMAIN,
+              "a replicas export with no row is EMPTY_EXPORT, never DRAINED, "
+              "unless the operator accepts it, and acceptance lifts nothing "
+              "else  <-- pinned defect")
+        v, info, sleeps = waited([rd(0, empty=True)])
+        check(v[0][1] == EMPTY_EXPORT and info["waited"] == 100
+              and "--accept-empty-replicas" in v[0][2],
+              "an empty replicas export waits to the timeout as UNKNOWN and "
+              "names the flag  <-- pinned defect")
+        v, info, sleeps = waited([rd(0, empty=True)], accept=True)
+        check(v[0][1] == DRAINED and sleeps == [],
+              "an accepted empty replicas export ends the wait as DRAINED")
         v, info, sleeps = waited([rd(0, held=[5]), rd(1, held=[5]), rd(2)])
         check(v[0][1] == DRAINED and sleeps == [30, 30]
               and info["fresh"] == 3 and info["waited"] == 60,
@@ -2658,10 +2705,23 @@ def self_test():
               and sorted(os.listdir(tmp)) == listing,
               "the command line reports anchors still there as UNKNOWN, "
               "exit 1, and writes nothing")
-        code, out, _ = run(wait0 + snap(at(0)) + ["--before-replicas", before])
+        empty_ok = ["--accept-empty-replicas"]
+        code, out, _ = run(wait0 + snap(at(0)) + ["--before-replicas", before]
+                           + empty_ok)
         check(code == 0 and "VERDICT: DRAINED" in out,
               "the command line exits 0 only when the id is proved "
-              "registered and nothing of it is left")
+              "registered, nothing of it is left, and an empty replicas "
+              "export was accepted")
+        code, out, _ = run(wait0 + snap(at(0)) + ["--before-replicas", before])
+        check(code == 1 and "EMPTY_EXPORT" in out
+              and "VERDICT: UNKNOWN" in out and "DRAINED:" not in out,
+              "a header-only replicas export that was not accepted is "
+              "EMPTY_EXPORT and exit 1, never a clean 0  <-- pinned defect")
+        code, out, _ = run(wait0 + snap(at(0), items=[5, 6])
+                           + ["--before-replicas", before] + empty_ok)
+        check(code == 1 and "NOT_UNREGISTERED" in out,
+              "accepting an empty replicas export lifts nothing when the "
+              "export has rows")
         code, out, _ = run(wait0 + snap(at(0), items=[5], held=[5]))
         check(code == 1 and "NOT_UNREGISTERED" in out,
               "an id whose item is still in the replicas export is "
@@ -2672,7 +2732,7 @@ def self_test():
               "UNSEEN and exit 1  <-- pinned defect")
         code, out, _ = run(["--await-drain", "5,6", "--drain-timeout", "0"]
                            + snap(at(0), held=[6]) + ["--before-replicas",
-                                                      before])
+                                                      before] + empty_ok)
         check(code == 1 and "DRAINED" in out and "1 of 2" in out,
               "one id drained and one with anchors is exit 1")
         real_open = OPENER.open
@@ -2735,6 +2795,9 @@ def self_test():
                   "a first read that fails is exit 2")
         cli_error(good + ["--before-replicas", path("nope.csv")], "nope.csv",
                   "a --before-replicas file that cannot be read is exit 2")
+        cli_error(argv + ["--accept-empty-replicas"],
+                  "--accept-empty-replicas is read only with --await-drain",
+                  "the accept flag without --await-drain is refused")
         cli_error(argv + ["--poll-seconds", "5"],
                   "--poll-seconds is read only with --await-drain",
                   "a wait flag without --await-drain is refused")
@@ -2754,6 +2817,7 @@ def self_test():
         thread.start()
         started = time.monotonic()
         code, out, _ = run(good + ["--before-replicas", before,
+                                   "--accept-empty-replicas",
                                    "--poll-seconds", "0.1",
                                    "--drain-timeout", "20"])
         thread.join()

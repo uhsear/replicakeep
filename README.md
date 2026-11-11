@@ -1,6 +1,6 @@
 # replicakeep
 
-Plan, then repair under `--apply`, an idle replica that may hold an enterprise geodatabase's compress floor.
+Plan, then repair under `--apply`, an idle replica that may hold an enterprise geodatabase's compress floor. Also wait, with a time limit, for an unregistered replica to drain.
 
 An enterprise geodatabase ran its compress every night. Every night the job exited 0 and the
 log said it succeeded. For months the geodatabase never got close to state 0. A layer of
@@ -75,11 +75,36 @@ PASS  a redirect is refused, so the token is never resent to its target  <-- pin
 ...
 PASS  a plan-only run never prints a target URL that holds a query string or login  <-- pinned defect
 ...
-230 assertions, 0 failed
+...
+PASS  an empty versions export is refused, never read as every replica drained  <-- pinned defect
+...
+PASS  nothing left, but a version name or item that could not be read, is BLIND and not DRAINED  <-- pinned defect
+...
+PASS  anchors that never leave end at the timeout as ANCHORS_REMAIN, never DRAINED, and the last sleep is cut to the time left  <-- pinned defect
+...
+PASS  an id never seen registered stays UNSEEN to the timeout, never DRAINED  <-- pinned defect
+...
+PASS  an export with the same or an earlier exported_at adds no evidence, so a rewritten stale file cannot show DRAINED  <-- pinned defect
+...
+PASS  without proof that the id was registered, a gone id is UNSEEN and exit 1  <-- pinned defect
+...
+PASS  --exit-on never cannot turn an UNKNOWN into exit 0  <-- pinned defect
+...
+PASS  the real clock: an export nobody refreshes ends at the timeout as UNKNOWN, exit 1  <-- pinned defect
+...
+273 assertions, 0 failed
 ```
 
-The block above is a real run, cut to 19 of its 230 PASS lines. Each line is verbatim, and
+The block above is a real run, cut to 27 of its 273 PASS lines. Each line is verbatim, and
 `...` marks the lines left out.
+
+The second half of the same trouble is the end of a replica that is abandoned. A replica that
+no one uses is unregistered, and the next step of the script is the compress. If the `SYNC_`
+versions of that replica are still in the geodatabase when the compress starts, the compress
+cannot fold the states they point at, and it exits 0 as before. `--await-drain` is the check for
+that. You give it the ids of the replicas that you just unregistered. It re-reads your exports
+until no replica item and no `SYNC_` version of those ids is left, or until its time limit ends.
+At the limit it says UNKNOWN and exits 1, never 0. "Waiting for a drain" below has the rules.
 
 ## What already exists
 
@@ -91,9 +116,13 @@ The block above is a real run, cut to 19 of its 230 PASS lines. Each line is ver
   no tool. It does not scale past a few replicas. It also needs someone to remember it, to pick a
   row that satisfies the replica's own filter, and to know which replicas share a dataset.
 - **[compressfloor](https://github.com/uhsear/compressfloor).** It reads exported system tables
-  and names what holds the floor. It diagnoses, and it prints an unregister plan. It does not
-  repair an idle replica. replicakeep is the repair for the one holder that a single edit can
-  release.
+  and names what holds the floor. It diagnoses, and it prints an unregister plan. Its plan
+  prints a rule for the wait after the unregister: count the replica's `SYNC_` versions every
+  30 seconds, go on when the count is unchanged for 3 polls, and give up after 1,800 seconds.
+  It does not run that wait, and it does not repair an idle replica. replicakeep is the repair
+  for the one holder that a single edit can release, and `--await-drain` runs the wait on
+  exports that you refresh. It does not stop early on an unchanged count: it waits for the
+  evidence until its limit.
 - **[geodatabase-replication-toiler](https://github.com/mattyschell/geodatabase-replication-toiler).**
   Scripts to create, check and test replicas, and a runbook that reads `GDB_REPLICALOG` to find
   why a replica failed. It does well at the life of a replica. Its README and its runbook say
@@ -119,9 +148,10 @@ exists.
 Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-party package.
 The tool reads files, and under `--apply` it calls a feature service over HTTP.
 
-The same 230 assertions pass on Windows (Python 3.13.2), on Windows (Python 3.9.25) and on
+The same 273 assertions pass on Windows (Python 3.13.2), on Windows (Python 3.9.25) and on
 Ubuntu 24.04 (Python 3.12.3). The output is identical on all three apart from line endings. The
-self-test takes about 7 seconds on Windows. Branch coverage of `replicakeep.py` is 100 percent with one
+self-test takes about 7 seconds on Windows, and about 1 second of those is real waits of the
+drain tests. Branch coverage of `replicakeep.py` is 100 percent with one
 pragma. See "Coverage".
 
 ```
@@ -140,6 +170,7 @@ python replicakeep.py --self-test
 python replicakeep.py --versions versions.csv --replicas replicas.csv --replica-log replica_log.csv
 python replicakeep.py ... --min-idle-days 14 --silent-days 3 --only 101,103
 python replicakeep.py ... --targets targets.csv --report plan.txt --apply
+python replicakeep.py --await-drain 56,57 --versions versions.csv --replicas replicas.csv
 ```
 
 The token for `--apply` comes from the `REPLICAKEEP_TOKEN` environment variable. There is no
@@ -164,6 +195,10 @@ ASCII, and it does not print the value.
 | `--exit-on` | `idle` | What makes the exit code 1: `idle`, `any` or `never`. See "Exit codes". |
 | `--report` | off | Write the report to this file. Needs `--apply`. The file is overwritten. |
 | `--apply` | off | Make the edits, and write `--report`. Needs `--targets` and `--report`. |
+| `--await-drain` | off | Replica ids, comma separated, that you just unregistered. Re-read `--versions` and `--replicas` until nothing of them is left, or until `--drain-timeout`. Needs `--versions` and `--replicas`. Takes no other flag but the three below. Writes nothing and opens no connection. |
+| `--before-replicas` | none | With `--await-drain`: a replicas export taken before the unregister. It proves that each id was registered. |
+| `--poll-seconds` | `30` | With `--await-drain`: seconds between two reads. Above 0 and at most 86400. |
+| `--drain-timeout` | `1800` | With `--await-drain`: stop waiting after this many seconds, and report UNKNOWN. 0 is one look. At most 86400. |
 | `--self-test` | off | Run the offline assertions and exit. Takes no other flag. |
 
 The parser refuses an abbreviated flag, so `--ap` is not `--apply`. The self-test pins this
@@ -182,6 +217,11 @@ Exit 2 is kept apart from exit 1 on purpose. A scheduler that cannot tell "the t
 from "findings exist" will show a failure every day, or will hide one. These are the same codes
 that [compressfloor](https://github.com/uhsear/compressfloor) uses, so one monitor can read both.
 `--exit-on never` keeps exit 2 and turns every finding into exit 0.
+
+`--await-drain` uses the same three codes. Exit 0 means every id is DRAINED. Exit 1 means at
+least one id is not confirmed drained when the wait ends, whatever the reason. Exit 2 means a
+flag was wrong or the first read failed. `--exit-on` is refused there, because it would let
+an UNKNOWN exit 0.
 
 The five statuses `NOT_SYNCING`, `NO_ACK`, `NO_DATASET`, `NO_TYPE` and `SHORT_LOG` are findings
 by default. An earlier version left the first three at exit 0, and called a missing `TargetType`
@@ -312,6 +352,87 @@ echoed, and a plan-only run shows such a target as hidden. A redirect is refused
 capabilities is refused. A branch versioned layer is refused, because the tool edits the
 version the service is published against.
 
+## Waiting for a drain
+
+One operator's script unregistered old replicas and went on to the compress in the same run. The
+`SYNC_` versions of those replicas were still in the geodatabase, and the compress reclaimed
+nothing. Nothing failed, and no error was logged. That is an observation from one estate. It is
+not a documented rule, and the logs are not published.
+
+Esri's page for the tool, `UnregisterReplica(in_geodatabase, in_replica)`, says: "If the replica
+has a version associated with it, this tool does not delete the version." The page does not say
+whether the unregister is synchronous, and it does not say what becomes of the `SYNC_` versions.
+So this tool does not assume that a drain happens, or when. It waits for the evidence, and it
+stops at a limit.
+
+`--await-drain` never unregisters, never deletes a version and never opens a connection. It
+cannot run SQL. You keep the two exports fresh by any means, for example a scheduled export of
+the two SELECTs under "The exports". Write each new file under another name and rename it over
+the old one. A half-written file fails its `row_count` check. The wait notes that failed read
+and goes on, but a rename gives it a whole file every time. The tool re-reads the two files at
+each poll.
+
+A reading counts only when its `exported_at` is later than the last one that counted. A file
+that nobody refreshed adds no evidence, and a file rewritten with the old `exported_at` cannot
+turn an id into DRAINED. The stamp has a resolution of one second, so poll no faster than that
+against a real export. The wait ends when every id is DRAINED, or when `--drain-timeout`
+seconds have passed. The last sleep is cut to the time left, so the run does not end after the
+limit. A read that fails after the first one is noted, and the wait continues. A failed first
+read exits 2.
+
+| Status | When | Counts as drained |
+|---|---|---|
+| `DRAINED` | No replica item and no `SYNC_` version of the id is in the last export, and the id was seen registered or anchored by a reading, or is in `--before-replicas`. | Yes. The only one. |
+| `NOT_UNREGISTERED` | The replica item is still in the replicas export. The unregister has not run, or has not taken effect. | No |
+| `ANCHORS_REMAIN` | The item is gone, and at least one `SYNC_` version of the id is still in the versions export. | No |
+| `UNSEEN` | Nothing of the id is in the exports, and nothing showed it registered. A mistyped id reads the same as a drained one. Pass `--before-replicas`. | No |
+| `BLIND` | Nothing of the id is in the exports, but a version name that holds `SYNC_` and fits no anchor pattern, or a replica item that could not be read, may own it. | No |
+
+The verdict is `DRAINED` only when every id is DRAINED. In every other case it is `UNKNOWN`, and
+the exit code is 1. The tool does not call a timeout a failure of the geodatabase or a success
+of the unregister. It says only that the evidence did not arrive. An empty replicas export
+(a header and no row) is a reading with no items: the last replica to be unregistered leaves it
+so. An empty versions export is refused, because `sde_versions` always holds `DEFAULT`, and
+read as no versions it would call every id drained. If `--before-replicas` does not show an id, only a reading that shows it registered or
+anchored can make it DRAINED.
+
+The defaults, 30 seconds and 1,800 seconds, are the numbers that compressfloor's plan prints.
+They come from one operator's runs, not from Esri. Tune them to your estate.
+
+A real run, on synthetic exports that another process rewrote after about three seconds. The
+exports hold two replicas, 56 and 57, with two anchors each:
+
+```
+$ python replicakeep.py --await-drain 56,57 --versions versions.csv --replicas replicas.csv --before-replicas before_replicas.csv --poll-seconds 2 --drain-timeout 20
+replicakeep: wait for unregistered replica(s) to drain
+This tool never unregisters. It reads the exports that you refresh, and says what is left of each replica.
+
+DRAINED          replica 56: no replica item and no SYNC_ version of it in the export
+DRAINED          replica 57: no replica item and no SYNC_ version of it in the export
+
+2 fresh export(s) read in 4 s, the last taken at 2026-03-31 12:10:00; 1 read(s) ignored because exported_at did not advance.
+VERDICT: DRAINED: 2 replica(s) have no item and no SYNC_ version left in the last export.
+exit 0
+```
+
+The same exports when nobody refreshes them. The wait ends at its limit:
+
+```
+$ python replicakeep.py --await-drain 56,57 --versions versions.csv --replicas replicas.csv --before-replicas before_replicas.csv --poll-seconds 2 --drain-timeout 5
+replicakeep: wait for unregistered replica(s) to drain
+This tool never unregisters. It reads the exports that you refresh, and says what is left of each replica.
+
+ANCHORS_REMAIN   replica 56: the replica item is gone, but 2 SYNC_ version(s) of it are still in the versions export
+ANCHORS_REMAIN   replica 57: the replica item is gone, but 2 SYNC_ version(s) of it are still in the versions export
+
+1 fresh export(s) read in 5 s, the last taken at 2026-03-31 12:05:00; 3 read(s) ignored because exported_at did not advance.
+VERDICT: UNKNOWN: 2 of 2 replica(s) are not confirmed drained. The wait ended at its limit or on a status above, and this is not a success. Esri says Unregister Replica does not delete the replica's version, so versions that never drain can be left behind: compressfloor --unregister-plan lists them in drop order.
+exit 1
+```
+
+The exit code is 1, and so is the code of every other run that ends without proof.
+compressfloor's `--unregister-plan` then orders the removal of what is left.
+
 ## Worked example
 
 This is the fixture from the self-test, with its detached anchor switched on, written to CSV
@@ -416,8 +537,21 @@ plan again. A replica whose generation moved is `ACTIVE` in that second plan.
 | The JSON form of a targets file works | Self-test: a plan-only run with a JSON targets file. |
 | The PostgreSQL queries produce the exports | A run on 2026-10-12 against PostgreSQL 16.15 with `psql --csv`, compared with the fixture's own plan. |
 | A DTD in a definition is refused | Self-test. |
+| A drain wait writes nothing and opens no connection | Self-test: the directory listing is unchanged after a run, and `OPENER.open` is replaced by a function that fails if it is called. |
+| An id with anchors left at the timeout is UNKNOWN, exit 1, never DRAINED | Self-test: a fake clock and scripted readings give the sleeps `[30, 30, 30, 10]`, and a run on the real clock with an export that nobody refreshes. |
+| An id that drains is DRAINED and the wait stops at once | Self-test: scripted readings, and a run on the real clock in which another thread rewrites the files in place after 0.4 seconds. |
+| A stale or older export adds no evidence | Self-test: readings with an equal and an earlier `exported_at`, whose gone state is ignored. |
+| An id never seen registered is UNSEEN, and `--before-replicas` proves it | Self-test, through `drain_verdicts`, `wait_drain` and the command line. |
+| A version name or item that could not be read makes a gone id BLIND | Self-test, through `drain_verdicts` and `drain_reading`. |
+| A read that fails after the first is survived, a failed first read exits 2 | Self-test: a scripted `InputError` and `OSError`, and a missing file through the command line. |
+| An empty versions export is refused, an empty replicas export is a reading | Self-test, through `drain_reading`. |
+| `--exit-on`, `--apply`, `--report` and the plan flags are refused with `--await-drain` | Self-test, through the command line. |
+| A poll or timeout of 0, a negative value, `nan` or `inf` is refused | Self-test, through the command line. |
+| The idle-replica plan still gives the same verdicts after `build` was split into helpers | Self-test: all 230 earlier assertions are unchanged. |
 
-I ran 25 one-line mutations of the code added in the last round with a script: the exit rule
+I ran 13 one-line mutations of the drain code with a script: the freshness test on `exported_at`, the proof test, the blind test, the timeout test, the cut of the last sleep, the exit rule, the item test, the anchor test, the survival of a failed read, the proved set, the two flag bounds and the `--before-replicas` read. The self-test killed all 13. Three were killed by a hang and not by a failed assertion: a timeout test of `left < 0` and the two widened flag bounds make a run on the real clock go on for 1,800 seconds or more, and I stopped each at 60 seconds. The script is not in the repository.
+
+I ran 25 one-line mutations of the code added in an earlier round with a script: the exit rule
 for unread items, the odd-name count, the anchor pattern, the report lines, the filter text and
 the one-layer check. The self-test killed 22. Three survived. Two of the three cannot change
 behavior: widening `[^.\s]` to `[^\s]` in the owner prefix matches the same names, and the
@@ -437,7 +571,7 @@ the self-test.
 ```
 python -m coverage run --branch replicakeep.py --self-test
 python -m coverage report -m
-replicakeep.py 1109 0 292 0 100%
+replicakeep.py 1338 0 340 0 100%
 ```
 
 The file ends with `if __name__ == "__main__":  # pragma: no branch`. Coverage runs the file
@@ -447,6 +581,24 @@ arm is the only difference. No other line is excluded.
 
 ## Limits
 
+- **That an unregister leaves `SYNC_` versions that drain later is an observation.** Esri
+  documents only that the tool does not delete the replica's version. `--await-drain` does not
+  assume a drain. At its limit it says UNKNOWN. It cannot tell a slow drain from versions that
+  stay for good.
+- **`--await-drain` cannot refresh an export.** It reads two files. If nothing rewrites them,
+  it reads one fresh export, waits, and ends UNKNOWN. The report counts the reads it ignored.
+- **A replicas export that is empty because it failed reads as no items.** A zero-byte file is
+  refused, but a file that holds only its header is a valid answer after the last unregister.
+  A failed export that leaves a header could hide a replica that is still registered. The id is
+  then DRAINED only if its `SYNC_` versions are gone from the versions export too.
+- **The drain check looks at replica ids, not at states.** A replica with no `SYNC_` version and
+  no item is DRAINED. Whether the compress then folds more is for compressfloor and a later
+  export to show.
+- **The wait is not tested against a slow real export.** The real-clock tests use files that
+  another thread of the self-test rewrites. A real `psql` loop was not run for this feature.
+  The same SELECTs were run against PostgreSQL on 2026-10-12.
+- **The self-test spends about 1 second in real waits.** A very slow machine can fail the
+  assertion that a refresh at 0.4 seconds ends the wait inside its 20-second limit.
 - **The core claim is an observation.** The logs are not published. Esri documents the need to
   synchronize regularly, not the case of an idle layer.
 - **XML element names are observed, not documented.** Esri's Technical Article 000011719
@@ -621,6 +773,12 @@ arm is the only difference. No other line is excluded.
 - [Replication and versioning](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/overview/replication-and-versioning.html):
   "Because of these system versions, you need to synchronize regularly to achieve an effective
   compress." "Several replicas can also share the same replica version."
+- [Unregister Replica (Data Management)](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/unregister-replica.html),
+  fetched on 2026-11-10: the signature is `arcpy.management.UnregisterReplica(in_geodatabase,
+  in_replica)`, a replica name must be fully qualified or the replica ID given, and "If the
+  replica has a version associated with it, this tool does not delete the version." The page says
+  nothing of timing and nothing of `SYNC_` versions. Esri's older page for the tool at
+  pro.arcgis.com now redirects here.
 - Esri Technical Article 000011719, "How To: Determine if there are detached replica system
   versions in the geodatabase". The address
   https://support.esri.com/en/technical-article/000011719 now leads to an archive page. The

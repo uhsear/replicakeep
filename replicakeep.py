@@ -29,6 +29,14 @@ compressfloor's --unregister-plan.
     python replicakeep.py --versions v.csv --replicas r.csv --replica-log l.csv
     python replicakeep.py ... --min-idle-days 14 --silent-days 3 --only 101,102
     python replicakeep.py ... --targets targets.csv --report plan.txt --apply
+    python replicakeep.py --await-drain 56,57 --versions v.csv --replicas r.csv
+
+--await-drain waits for replicas that were just unregistered. It re-reads the
+two exports that you refresh until no replica item and no SYNC_ version of the
+ids is left, or until --drain-timeout seconds pass. It writes nothing and uses
+no network. Only DRAINED for every id exits 0. A timeout reports UNKNOWN and
+exits 1. Esri documents no timing for the drain, so the tool waits for
+evidence and does not assume it.
 
 The token for --apply comes from the REPLICAKEEP_TOKEN environment variable
 only. It is sent in the X-Esri-Authorization header, never in a URL, and never
@@ -58,6 +66,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -80,6 +89,13 @@ DEFAULT_MAX_EDITS = 10
 SUCCESS_CODE = 0
 # GDB_REPLICALOG.event: Esri defines 1 as an import and 2 as an export.
 DEFAULT_EVENT = 1
+# The drain wait (--await-drain). Esri documents that Unregister Replica does
+# not delete the replica's version. It documents no timing. One operator saw
+# the SYNC_ versions of an unregistered replica leave later. These two numbers
+# are that operator's, not Esri's: tune them to your own estate.
+DEFAULT_POLL_SECONDS = 30
+DEFAULT_DRAIN_TIMEOUT = 1800
+MAX_WAIT_SECONDS = 86400
 REQUEST_TIMEOUT = 30
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 TOKEN_ENV = "REPLICAKEEP_TOKEN"
@@ -111,6 +127,14 @@ NO_TYPE = "NO_TYPE"
 SHORT_LOG = "SHORT_LOG"
 NO_ANCHOR = "NO_ANCHOR"
 EXCLUDED = "EXCLUDED"
+# --await-drain: what is left of an unregistered replica. Every status but
+# DRAINED is "not confirmed", so the run never exits 0 on it.
+DRAINED = "DRAINED"
+NOT_UNREGISTERED = "NOT_UNREGISTERED"
+ANCHORS_REMAIN = "ANCHORS_REMAIN"
+UNSEEN = "UNSEEN"
+BLIND = "BLIND"
+READ_FAILURES = (IOError, OSError, ValueError, csv.Error)
 # Anchors held, and no edit moves them or the tool could not judge. A clean
 # exit here would be the false green this tool exists to end.
 UNJUDGED = (NOT_SYNCING, NO_ACK, NO_DATASET, NO_TYPE, SHORT_LOG)
@@ -243,27 +267,19 @@ def parse_definition(xml):
             "datasets": datasets}
 
 
-def build(versions, replicas, replica_log, as_of=None):
-    """The model: anchors by replica id, replicas, log rows by item objectid.
+def read_clock(versions):
+    """The database clock of a versions export: its one exported_at time."""
+    if len(set(clean(r.get(EXPORTED_AT)) for r in versions)) != 1:
+        raise InputError("the versions export does not carry one "
+                         "exported_at time on every row.")
+    when = cell(versions[0], EXPORTED_AT, "versions", 0, parse_time)
+    if when is None:
+        raise InputError("the versions export has a blank exported_at.")
+    return when
 
-    The database clock is the exported_at of the versions export, so the same
-    exports give the same plan on any day. as_of replaces it.
-    """
-    if not versions:
-        raise InputError("the versions export is empty. A failed export "
-                         "leaves an empty file, and read as no versions it "
-                         "would call every replica clean.")
-    if not replicas:
-        raise InputError("the replicas export is empty. A failed export "
-                         "leaves an empty file, and read as no replicas it "
-                         "would call every anchor detached.")
-    if as_of is None:
-        if len(set(clean(r.get(EXPORTED_AT)) for r in versions)) != 1:
-            raise InputError("the versions export does not carry one "
-                             "exported_at time on every row.")
-        as_of = cell(versions[0], EXPORTED_AT, "versions", 0, parse_time)
-        if as_of is None:
-            raise InputError("the versions export has a blank exported_at.")
+
+def collect_anchors(versions):
+    """Anchor version names by replica id, and the count of odd names."""
     anchors, odd = {}, 0
     for r in versions:
         name = clean(r.get("name"))
@@ -274,6 +290,11 @@ def build(versions, replicas, replica_log, as_of=None):
             # Looks like an anchor, matches no pattern. Silence here would
             # call every replica clean.
             odd += 1
+    return anchors, odd
+
+
+def read_items(replicas):
+    """The usable replica items, and the count of items that were not."""
     reps, unread, objectids = [], 0, set()
     for i, r in enumerate(replicas):
         objectid = cell(r, "objectid", "replicas", i, to_int)
@@ -289,6 +310,27 @@ def build(versions, replicas, replica_log, as_of=None):
     if len(set(r["id"] for r in reps)) != len(reps):
         raise InputError("two replica items carry one replica ID. The tool "
                          "cannot tell which one owns the anchors.")
+    return reps, unread
+
+
+def build(versions, replicas, replica_log, as_of=None):
+    """The model: anchors by replica id, replicas, log rows by item objectid.
+
+    The database clock is the exported_at of the versions export, so the same
+    exports give the same plan on any day. as_of replaces it.
+    """
+    if not versions:
+        raise InputError("the versions export is empty. A failed export "
+                         "leaves an empty file, and read as no versions it "
+                         "would call every replica clean.")
+    if not replicas:
+        raise InputError("the replicas export is empty. A failed export "
+                         "leaves an empty file, and read as no replicas it "
+                         "would call every anchor detached.")
+    if as_of is None:
+        as_of = read_clock(versions)
+    anchors, odd = collect_anchors(versions)
+    reps, unread = read_items(replicas)
     if anchors and not reps:
         raise InputError("anchor versions exist, but no item in the replicas "
                          "export is a usable GPReplica, so every anchor would "
@@ -530,6 +572,127 @@ def describe(report, min_idle_days, applied=None, apply=False):
                  "move or that could not be judged%s. %s" % (
                      idle, min_idle_days, len(report["edits"]), unjudged,
                      extra, ending))
+    return lines
+
+
+# ------------------------------------------------------------------ the drain
+
+def drain_reading(versions, replicas):
+    """One reading of the exports for --await-drain.
+
+    at is the export's database clock. items holds the ids of the replica
+    items that parsed, anchors the replica ids that hold SYNC_ versions, and
+    blind the count of things that could hide an owner: a version name that
+    holds SYNC_ and fits no pattern, and a replica item that did not parse.
+    An empty replicas export is allowed here. The last replica to be
+    unregistered leaves the export with a header and no row. An empty
+    versions export is refused, because sde_versions always holds DEFAULT.
+    """
+    if not versions:
+        raise InputError("the versions export is empty. A failed export "
+                         "leaves an empty file, and read as no versions it "
+                         "would call every replica drained.")
+    anchors, odd = collect_anchors(versions)
+    items, unread = read_items(replicas)
+    return {"at": read_clock(versions), "anchors": anchors,
+            "items": set(r["id"] for r in items), "blind": odd + unread}
+
+
+def drain_verdicts(ids, reading, proved):
+    """One verdict per id: (id, status, detail). proved holds the ids that
+    some reading, or the --before-replicas export, showed as registered or
+    anchored. Without that proof an id with nothing left is UNSEEN, because a
+    mistyped id reads the same as a drained one."""
+    out = []
+    for rid in sorted(ids):
+        held = len(reading["anchors"].get(rid, []))
+        if rid in reading["items"]:
+            out.append((rid, NOT_UNREGISTERED, "its replica item is still in "
+                        "the replicas export, so the unregister has not run "
+                        "or has not taken effect"))
+        elif held:
+            out.append((rid, ANCHORS_REMAIN, "the replica item is gone, but "
+                        "%d SYNC_ version(s) of it are still in the versions "
+                        "export" % held))
+        elif reading["blind"]:
+            out.append((rid, BLIND, "nothing of it is left that the tool can "
+                        "read, but %d version name(s) or replica item(s) "
+                        "could not be read and one may own it"
+                        % reading["blind"]))
+        elif rid not in proved:
+            out.append((rid, UNSEEN, "nothing of it is in the exports, but "
+                        "this run never saw it registered, so a mistyped id "
+                        "reads the same. Pass the replicas export taken "
+                        "before the unregister as --before-replicas"))
+        else:
+            out.append((rid, DRAINED, "no replica item and no SYNC_ version "
+                        "of it in the export"))
+    return out
+
+
+def wait_drain(read, ids, proved, poll, timeout, clock, sleep):
+    """Read until every id is DRAINED or the time budget ends.
+
+    Returns (verdicts, info). read() gives one reading and may raise. A
+    reading counts only when its exported_at is later than the last one
+    counted, so a file nobody refreshed adds no evidence. After the first
+    reading, a read that fails is noted and the wait goes on, because an
+    export that is being rewritten is torn for a moment. The last wait is
+    cut to the time left, so the run ends at the budget and not after it.
+    """
+    start, reading = clock(), None
+    info = {"fresh": 0, "ignored": 0, "problem": ""}
+    while True:
+        try:
+            new = read()
+        except READ_FAILURES + (InputError,) as exc:
+            if reading is None:
+                raise
+            info["problem"] = clean(exc)
+            new = None
+        if new is not None and (reading is None or new["at"] > reading["at"]):
+            reading = new
+            info["fresh"] += 1
+            proved.update(i for i in ids if i in new["items"]
+                          or i in new["anchors"])
+        elif new is not None:
+            info["ignored"] += 1
+        verdicts = drain_verdicts(ids, reading, proved)
+        left = timeout - (clock() - start)
+        if left <= 0 or all(v[1] == DRAINED for v in verdicts):
+            info["waited"], info["at"] = clock() - start, reading["at"]
+            return verdicts, info
+        sleep(min(poll, left))
+
+
+def describe_drain(verdicts, info):
+    """The drain report as a list of lines. Only DRAINED everywhere is clean."""
+    lines = ["replicakeep: wait for unregistered replica(s) to drain",
+             "This tool never unregisters. It reads the exports that you "
+             "refresh, and says what is left of each replica.", ""]
+    for rid, status, detail in verdicts:
+        lines.append("%-16s replica %d: %s" % (status, rid, detail))
+    lines.append("")
+    lines.append("%d fresh export(s) read in %d s, the last taken at %s; "
+                 "%d read(s) ignored because exported_at did not advance."
+                 % (info["fresh"], info["waited"],
+                    info["at"].strftime("%Y-%m-%d %H:%M:%S"),
+                    info["ignored"]))
+    if info["problem"]:
+        lines.append("The last failed read said: %s" % info["problem"])
+    open_ = [v for v in verdicts if v[1] != DRAINED]
+    if not open_:
+        lines.append("VERDICT: DRAINED: %d replica(s) have no item and no "
+                     "SYNC_ version left in the last export."
+                     % len(verdicts))
+    else:
+        lines.append("VERDICT: UNKNOWN: %d of %d replica(s) are not "
+                     "confirmed drained when the wait ended. This is not a "
+                     "success. Esri says Unregister Replica does not delete "
+                     "a replica's version, and says nothing of what becomes "
+                     "of its SYNC_ versions. If they never drain, "
+                     "compressfloor --unregister-plan lists them in drop "
+                     "order." % (len(open_), len(verdicts)))
     return lines
 
 
@@ -858,6 +1021,22 @@ def _parse(argv):
                          "replica item), or never. A failure is exit 2 "
                          "either way.")
     ap.add_argument("--report", help="write the report to this file")
+    ap.add_argument("--await-drain", dest="await_drain",
+                    help="replica ids, comma separated, that were just "
+                         "unregistered: re-read --versions and --replicas "
+                         "until nothing of them is left or the time is up. "
+                         "Never exits 0 unless every id is confirmed "
+                         "drained.")
+    ap.add_argument("--before-replicas", dest="before_replicas",
+                    help="with --await-drain: a replicas export taken before "
+                         "the unregister, to prove each id was registered")
+    ap.add_argument("--poll-seconds", dest="poll_seconds", type=float,
+                    help="with --await-drain: seconds between reads "
+                         "(default %d)" % DEFAULT_POLL_SECONDS)
+    ap.add_argument("--drain-timeout", dest="drain_timeout", type=float,
+                    help="with --await-drain: stop waiting after this many "
+                         "seconds, and report UNKNOWN (default %d)"
+                         % DEFAULT_DRAIN_TIMEOUT)
     ap.add_argument("--apply", action="store_true",
                     help="make the edits, and write --report. Without this "
                          "nothing is written and no network is used.")
@@ -885,12 +1064,21 @@ def main(argv=None):
 def _main(args):
     given = [k for k in ("versions", "replicas", "replica_log", "targets",
                          "min_idle_days", "silent_days", "event", "only",
-                         "max_edits", "as_of", "exit_on", "report")
+                         "max_edits", "as_of", "exit_on", "report",
+                         "await_drain", "before_replicas", "poll_seconds",
+                         "drain_timeout")
              if getattr(args, k) is not None] + ["apply"] * args.apply
     if args.self_test:
         if given:
             return fail("--self-test takes no other flag.")
         return self_test()
+    if args.await_drain is not None:
+        return drain_main(args, given)
+    waits = [k for k in ("before_replicas", "poll_seconds", "drain_timeout")
+             if getattr(args, k) is not None]
+    if waits:
+        return fail("--%s is read only with --await-drain."
+                    % waits[0].replace("_", "-"))
     absent = [k for k in ("versions", "replicas", "replica_log")
               if not getattr(args, k)]
     if absent:
@@ -968,6 +1156,51 @@ def _main(args):
         return fail("an edit was refused or could not be checked. Read the "
                     "report.")
     return gate(report, args.exit_on or "idle", repaired)
+
+
+def drain_main(args, given, clock=time.monotonic, sleep=time.sleep):
+    """--await-drain: exit 0 only when every id is confirmed drained."""
+    allowed = ("versions", "replicas", "await_drain", "before_replicas",
+               "poll_seconds", "drain_timeout")
+    other = [k for k in given if k not in allowed]
+    if other:
+        return fail("--await-drain takes only --versions, --replicas, "
+                    "--before-replicas, --poll-seconds and --drain-timeout. "
+                    "It writes nothing, so --apply, --report and the plan "
+                    "flags do not apply.")
+    absent = [k for k in ("versions", "replicas") if not getattr(args, k)]
+    if absent:
+        return fail("--%s is required." % ", --".join(absent))
+    poll = (DEFAULT_POLL_SECONDS if args.poll_seconds is None
+            else args.poll_seconds)
+    timeout = (DEFAULT_DRAIN_TIMEOUT if args.drain_timeout is None
+               else args.drain_timeout)
+    if not 0 < poll <= MAX_WAIT_SECONDS:
+        return fail("--poll-seconds must be above 0 and at most %d."
+                    % MAX_WAIT_SECONDS)
+    if not 0 <= timeout <= MAX_WAIT_SECONDS:
+        return fail("--drain-timeout must be between 0 and %d."
+                    % MAX_WAIT_SECONDS)
+    try:
+        ids = parse_ids(args.await_drain)
+    except ValueError as exc:
+        return fail("%s." % exc)
+    try:
+        proved = set()
+        if args.before_replicas:
+            items, _ = read_items(read_rows(args.before_replicas, "replicas"))
+            proved = set(r["id"] for r in items) & ids
+
+        def read():
+            return drain_reading(read_rows(args.versions, "versions"),
+                                 read_rows(args.replicas, "replicas"))
+        verdicts, info = wait_drain(read, ids, proved, poll, timeout, clock,
+                                    sleep)
+    except READ_FAILURES + (InputError,) as exc:
+        return fail(clean(exc))
+    for line in describe_drain(verdicts, info):
+        print(line)
+    return 0 if all(v[1] == DRAINED for v in verdicts) else 1
 
 
 # ------------------------------------------------------------------- self-test
@@ -2170,6 +2403,277 @@ def self_test():
             check(code == 2 and name in err and "not a finding" in err,
                   "an unexpected %s exits 2, never the 1 Python would "
                   "give  <-- pinned defect" % name)
+
+        # ---- the drain wait (--await-drain), over scripted readings
+        def rd(minute, items=(), held=(), blind=0):
+            return {"at": AS_OF + datetime.timedelta(minutes=minute),
+                    "items": set(items), "blind": blind,
+                    "anchors": dict((i, ["SYNC_SEND_%d_3" % i])
+                                    for i in held)}
+
+        def scripted(readings):
+            """A read() that gives these readings in turn, then repeats the
+            last. An Exception in the list is raised instead."""
+            queue = list(readings)
+
+            def read():
+                item = queue.pop(0) if len(queue) > 1 else queue[0]
+                if isinstance(item, Exception):
+                    raise item
+                return item
+            return read
+
+        def waited(readings, ids=(5,), proved=(5,), poll=30, timeout=100):
+            clock = [0.0]
+            sleeps = []
+
+            def sleep(seconds):
+                sleeps.append(seconds)
+                clock[0] += seconds
+            verdicts, info = wait_drain(scripted(readings), set(ids),
+                                        set(proved), poll, timeout,
+                                        lambda: clock[0], sleep)
+            return verdicts, info, sleeps
+
+        dr_fx = fixture()
+        dr = drain_reading(dr_fx["versions"], dr_fx["replicas"])
+        check(dr["at"] == AS_OF and 101 in dr["items"] and -1 not in dr["items"]
+              and 101 in dr["anchors"] and dr["blind"] == 2,
+              "a drain reading holds the export time, the replica items, the "
+              "anchors and the two items it could not read")
+        dr_odd = fixture()
+        dr_odd["versions"].append({"name": "SYNC_BROKEN", "exported_at":
+                                   ago(0), "row_count": 0})
+        check(drain_reading(dr_odd["versions"], [])["blind"] == 1
+              and drain_reading(dr_odd["versions"], [])["items"] == set(),
+              "an empty replicas export is a reading with no items, and a "
+              "SYNC_ name that fits no pattern is counted as blind")
+        check("empty" in message(lambda: drain_reading([], dr_fx["replicas"])),
+              "an empty versions export is refused, never read as every "
+              "replica drained  <-- pinned defect")
+        raises(lambda: drain_reading(
+            dr_fx["versions"], dr_fx["replicas"] * 2),
+            "two items with one objectid are refused in a drain reading")
+
+        by5 = dict((v[0], v[1]) for v in drain_verdicts(
+            [1, 2, 3, 4], rd(0, items=[1], held=[2]), set([1, 2, 4])))
+        check(by5 == {1: NOT_UNREGISTERED, 2: ANCHORS_REMAIN, 3: UNSEEN,
+                      4: DRAINED},
+              "an id with its item is NOT_UNREGISTERED, with only anchors "
+              "ANCHORS_REMAIN, with nothing and no proof UNSEEN, with "
+              "nothing and proof DRAINED")
+        check(drain_verdicts([4], rd(0, blind=1), set([4]))[0][1] == BLIND,
+              "nothing left, but a version name or item that could not be "
+              "read, is BLIND and not DRAINED  <-- pinned defect")
+
+        v, info, sleeps = waited([rd(0, held=[5]), rd(1, held=[5]), rd(2)])
+        check(v[0][1] == DRAINED and sleeps == [30, 30]
+              and info["fresh"] == 3 and info["waited"] == 60,
+              "anchors that leave after two polls end the wait as DRAINED, "
+              "and the wait stops at once")
+        v, info, sleeps = waited([rd(0, held=[5])])
+        check(v[0][1] == ANCHORS_REMAIN and sleeps == [30, 30, 30, 10]
+              and info["waited"] == 100 and info["fresh"] == 1
+              and info["ignored"] == 4,
+              "anchors that never leave end at the timeout as "
+              "ANCHORS_REMAIN, never DRAINED, and the last sleep is cut to "
+              "the time left  <-- pinned defect")
+        v, info, sleeps = waited([rd(0, held=[5])], timeout=0)
+        check(v[0][1] == ANCHORS_REMAIN and sleeps == [] and info["fresh"] == 1,
+              "a timeout of 0 is one look and no sleep")
+        v, info, sleeps = waited([rd(0)], proved=())
+        check(v[0][1] == UNSEEN and info["waited"] == 100,
+              "an id never seen registered stays UNSEEN to the timeout, "
+              "never DRAINED  <-- pinned defect")
+        v, info, sleeps = waited([rd(0)])
+        check(v[0][1] == DRAINED and sleeps == [],
+              "an id proved registered that is already gone is DRAINED at "
+              "the first look")
+        v, info, sleeps = waited([rd(0, held=[5]), rd(0), rd(-5)])
+        check(v[0][1] == ANCHORS_REMAIN and info["fresh"] == 1
+              and info["ignored"] == 4,
+              "an export with the same or an earlier exported_at adds no "
+              "evidence, so a rewritten stale file cannot show DRAINED  "
+              "<-- pinned defect")
+        v, info, sleeps = waited([rd(0, held=[5]), InputError("torn export"),
+                                  rd(3)])
+        check(v[0][1] == DRAINED and info["problem"] == "torn export"
+              and info["fresh"] == 2,
+              "a read that fails after the first is noted, and the wait goes "
+              "on")
+        v, info, sleeps = waited([rd(0, held=[5]), OSError("locked")])
+        check(v[0][1] == ANCHORS_REMAIN and info["problem"] == "locked",
+              "a read that keeps failing ends as UNKNOWN with the last "
+              "problem, not as DRAINED")
+        raises(lambda: waited([InputError("no file")]),
+               "a failed first read is an error, not a wait")
+        v, info, sleeps = waited([rd(0, items=[5, 6], held=[5, 6]),
+                                  rd(1, held=[6]), rd(2, held=[6])],
+                                 ids=(5, 6), proved=(5, 6))
+        check(dict((x[0], x[1]) for x in v) == {5: DRAINED, 6: ANCHORS_REMAIN},
+              "two ids are judged one by one, and one DRAINED id does not "
+              "end the wait for the other")
+        lines = describe_drain(v, info)
+        check(lines[-1].startswith("VERDICT: UNKNOWN: 1 of 2 replica(s)")
+              and "not a success" in lines[-1]
+              and any(l.startswith("DRAINED") for l in lines),
+              "one id not confirmed makes the verdict UNKNOWN")
+        v, info, sleeps = waited([rd(0, held=[5]), InputError("torn"), rd(1)])
+        lines = describe_drain(v, info)
+        check(lines[-1].startswith("VERDICT: DRAINED: 1 replica(s)")
+              and "UNKNOWN" not in lines[-1]
+              and "The last failed read said: torn" in lines,
+              "a drained run says DRAINED, and keeps the failed read it "
+              "saw on the way")
+
+        # ---- the drain wait, through the command line, on files
+        def snap(at, items=(), held=(), extra=(), stem="d"):
+            names = (["DEFAULT", "ED_WO"] + list(extra)
+                     + ["SYNC_SEND_%d_3" % i for i in held]
+                     + ["SYNC_RECEIVE_%d_3" % i for i in held])
+            write_csv(path(stem + "_v.csv"), [
+                {"name": n, "exported_at": at, "row_count": len(names)}
+                for n in names])
+            if items:
+                write_csv(path(stem + "_r.csv"), [
+                    {"objectid": 8000 + i, "item_type": "Replica",
+                     "definition": definition(i, "r%d" % i),
+                     "row_count": len(items)} for i in items])
+            else:
+                put(stem + "_r.csv", "objectid,item_type,definition,"
+                    "row_count\n")
+            return ["--versions", path(stem + "_v.csv"), "--replicas",
+                    path(stem + "_r.csv")]
+
+        def at(minute):
+            return (AS_OF + datetime.timedelta(minutes=minute)).strftime(
+                "%Y-%m-%d %H:%M:%S")
+
+        before = path("before_r.csv")
+        write_csv(before, [{"objectid": 8005, "item_type": "Replica",
+                            "definition": definition(5, "r5"),
+                            "row_count": 1}])
+        wait0 = ["--await-drain", "5", "--drain-timeout", "0"]
+        held_args = snap(at(0), held=[5])
+        listing = sorted(os.listdir(tmp))
+        code, out, _ = run(wait0 + held_args)
+        check(code == 1 and "ANCHORS_REMAIN" in out
+              and "VERDICT: UNKNOWN" in out
+              and sorted(os.listdir(tmp)) == listing,
+              "the command line reports anchors still there as UNKNOWN, "
+              "exit 1, and writes nothing")
+        code, out, _ = run(wait0 + snap(at(0)) + ["--before-replicas", before])
+        check(code == 0 and "VERDICT: DRAINED" in out,
+              "the command line exits 0 only when the id is proved "
+              "registered and nothing of it is left")
+        code, out, _ = run(wait0 + snap(at(0), items=[5], held=[5]))
+        check(code == 1 and "NOT_UNREGISTERED" in out,
+              "an id whose item is still in the replicas export is "
+              "NOT_UNREGISTERED even when its anchors are there too")
+        code, out, _ = run(wait0 + snap(at(0)))
+        check(code == 1 and "UNSEEN" in out,
+              "without proof that the id was registered, a gone id is "
+              "UNSEEN and exit 1  <-- pinned defect")
+        code, out, _ = run(["--await-drain", "5,6", "--drain-timeout", "0"]
+                           + snap(at(0), held=[6]) + ["--before-replicas",
+                                                      before])
+        check(code == 1 and "DRAINED" in out and "1 of 2" in out,
+              "one id drained and one with anchors is exit 1")
+        real_open = OPENER.open
+        OPENER.open = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("network used"))
+        try:
+            code, out, err = run(wait0 + held_args)
+        finally:
+            OPENER.open = real_open
+        check(code == 1 and "network used" not in err,
+              "a drain wait opens no connection")
+        code, out, _ = run(["--await-drain", "101", "--drain-timeout", "0"]
+                           + argv[:4])
+        check(code == 1 and "NOT_UNREGISTERED" in out,
+              "a replica whose item is still in the replicas export is "
+              "NOT_UNREGISTERED")
+        write_csv(path("dd_v.csv"), fixture(True)["versions"])
+        code, out, _ = run(["--await-drain", "77", "--drain-timeout", "0",
+                            "--versions", path("dd_v.csv"), "--replicas",
+                            path("replicas.csv")])
+        check(code == 1 and "ANCHORS_REMAIN" in out and "BLIND" not in out,
+              "an anchor whose replica item is gone is ANCHORS_REMAIN on "
+              "the synthetic fixture")
+
+        def cli_error(extra, text, label):
+            code, out, err = run(extra)
+            check(code == 2 and text in err and out == "", label)
+
+        good = ["--await-drain", "5", "--versions", path("d_v.csv"),
+                "--replicas", path("d_r.csv")]
+        for extra, text, label in (
+                (["--apply"], "--await-drain takes only",
+                 "--apply with --await-drain is refused"),
+                (["--report", path("x.txt")], "--await-drain takes only",
+                 "--report with --await-drain is refused"),
+                (["--exit-on", "never"], "--await-drain takes only",
+                 "--exit-on never cannot turn an UNKNOWN into exit 0  "
+                 "<-- pinned defect"),
+                (["--replica-log", path("replica_log.csv")],
+                 "--await-drain takes only",
+                 "--replica-log with --await-drain is refused"),
+                (["--poll-seconds", "0"], "--poll-seconds must be above 0",
+                 "a poll of 0 seconds is refused"),
+                (["--poll-seconds", "nan"], "--poll-seconds must be above 0",
+                 "a poll of nan is refused"),
+                (["--drain-timeout", "-1"], "--drain-timeout must be between",
+                 "a negative timeout is refused"),
+                (["--drain-timeout", "inf"], "--drain-timeout must be between",
+                 "an infinite timeout is refused")):
+            cli_error(good + extra, text, label)
+        cli_error(["--await-drain", "all"] + good[2:], "digits separated",
+                  "--await-drain all is refused")
+        cli_error(good[:2] + good[2:4], "--replicas is required",
+                  "--await-drain without --replicas is refused")
+        cli_error(good[:2] + ["--replicas", path("d_r.csv")],
+                  "--versions is required",
+                  "--await-drain without --versions is refused")
+        cli_error(["--await-drain", "5", "--versions", path("nope.csv"),
+                   "--replicas", path("d_r.csv")], "nope.csv",
+                  "a first read that fails is exit 2")
+        cli_error(good + ["--before-replicas", path("nope.csv")], "nope.csv",
+                  "a --before-replicas file that cannot be read is exit 2")
+        cli_error(argv + ["--poll-seconds", "5"],
+                  "--poll-seconds is read only with --await-drain",
+                  "a wait flag without --await-drain is refused")
+        cli_error(["--self-test", "--await-drain", "5"],
+                  "--self-test takes no other flag",
+                  "--self-test takes no --await-drain")
+
+        # A real wait: another thread rewrites the export in place while the
+        # tool polls. A read of a half-written file is a failed read that the
+        # wait survives, and the next look reads the new file.
+        snap(at(0), held=[5])
+
+        def refresh():
+            time.sleep(0.4)
+            snap(at(5))
+        thread = threading.Thread(target=refresh)
+        thread.start()
+        started = time.monotonic()
+        code, out, _ = run(good + ["--before-replicas", before,
+                                   "--poll-seconds", "0.1",
+                                   "--drain-timeout", "20"])
+        thread.join()
+        check(code == 0 and "VERDICT: DRAINED" in out
+              and "2 fresh export(s)" in out
+              and time.monotonic() - started < 15,
+              "the real clock: a refresh during the wait is read and ends "
+              "it as DRAINED")
+        snap(at(0), held=[5])
+        code, out, _ = run(good + ["--before-replicas", before,
+                                   "--poll-seconds", "0.1",
+                                   "--drain-timeout", "0.3"])
+        check(code == 1 and "VERDICT: UNKNOWN" in out
+              and "1 fresh export(s)" in out,
+              "the real clock: an export nobody refreshes ends at the "
+              "timeout as UNKNOWN, exit 1  <-- pinned defect")
 
         meta = Harness()
         with contextlib.redirect_stdout(io.StringIO()) as sink:

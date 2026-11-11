@@ -1303,7 +1303,7 @@ def fixture(detached=False):
                          "-1", "sync_item", root="GPSyncReplica")})
     replicas.append({"objectid": 9012, "item_type": "Replica",
                      "definition": definition("-1", "no_id")})
-    names = ["DEFAULT", "ED_WO", "SYNC_RECEIVE_REC_101_4"]
+    names = ["DEFAULT", "EDIT_VER", "SYNC_RECEIVE_REC_101_4"]
     names += ["SYNC_SEND_77_1"] * detached
     for rid in (101, 102, 103, 104, 105, 106, 107, 108, 109):
         names += ["SYNC_SEND_%d_3" % rid, "SYNC_RECEIVE_%d_3" % rid]
@@ -2624,7 +2624,7 @@ def self_test():
 
         # ---- the drain wait, through the command line, on files
         def snap(at, items=(), held=(), extra=(), stem="d"):
-            names = (["DEFAULT", "ED_WO"] + list(extra)
+            names = (["DEFAULT", "EDIT_VER"] + list(extra)
                      + ["SYNC_SEND_%d_3" % i for i in held]
                      + ["SYNC_RECEIVE_%d_3" % i for i in held])
             write_csv(path(stem + "_v.csv"), [

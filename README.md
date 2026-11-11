@@ -373,7 +373,8 @@ stops at a limit.
 `--await-drain` never unregisters, never deletes a version and never opens a connection. It
 cannot run SQL. You keep the two exports fresh by any means, for example a scheduled export of
 the two SELECTs under "The exports". Write each new file under another name and rename it over
-the old one. A half-written file fails its `row_count` check. The wait notes that failed read
+the old one. A half-written versions file fails its `row_count` check. A replicas file cut
+before its first row has no `row_count` to fail (see Limits). The wait notes that failed read
 and goes on, but a rename gives it a whole file every time. The tool re-reads the two files at
 each poll.
 
@@ -431,7 +432,7 @@ ANCHORS_REMAIN   replica 56: the replica item is gone, but 2 SYNC_ version(s) of
 ANCHORS_REMAIN   replica 57: the replica item is gone, but 2 SYNC_ version(s) of it are still in the versions export
 
 1 fresh export(s) read in 5 s, the last taken at 2026-03-31 12:05:00; 3 read(s) ignored because exported_at did not advance.
-VERDICT: UNKNOWN: 2 of 2 replica(s) are not confirmed drained. The wait ended at its limit or on a status above, and this is not a success. Esri says Unregister Replica does not delete the replica's version, so versions that never drain can be left behind: compressfloor --unregister-plan lists them in drop order.
+VERDICT: UNKNOWN: 2 of 2 replica(s) are not confirmed drained when the wait ended. This is not a success. Esri says Unregister Replica does not delete a replica's version, and says nothing of what becomes of its SYNC_ versions. If they never drain, compressfloor --unregister-plan lists them in drop order.
 exit 1
 ```
 
@@ -509,7 +510,8 @@ exit 1
 The exit code is 1 on purpose. The three idle replicas were edited and are no longer findings,
 but replicas 106, 107 and 108 still hold anchors that this run cannot move or judge. The
 anchor of replica id 77 counts too, because two items in the export could not be read. The run
-sent ten read requests before its first write: nine in phase one, and one more read of the first row. After the three edits, the stub's rows held
+sent ten read requests before its first write: nine in phase one, and one more read of the first row. The row ids in this run are set by the self-test
+stub, so a run from the README's inputs alone shows OBJECTID 7 for edit 1, not 9. After the three edits, the stub's rows held
 their old values and a newer edit date. Nothing in the output, the report or any URL held the
 token. The next step is outside the tool: wait for the next sync, export again, and run the
 plan again. A replica whose generation moved is `ACTIVE` in that second plan.
@@ -674,7 +676,7 @@ arm is the only difference. No other line is excluded.
   IDs. On a larger layer the row is the lowest one returned, which still satisfies the filter.
 - **A `where` clause is the replica's filter, sent as written.** It must use field names that
   the service exposes. A filter that the service cannot parse fails in phase one. The filter
-  text goes through the same escaping as a name, so a newline in a filter shows as `
+  text goes through the same escaping as a name, so a newline in a filter shows as the two characters `
 ` and
   cannot forge a `VERDICT` line in the plan or the report.
 - **A multi-dataset replica gets one edit, on its first dataset only.** If that dataset has no
@@ -797,6 +799,23 @@ arm is the only difference. No other line is excluded.
   and that exits 2.
 - **pyflakes was run on Windows only (Python 3.13.2).** The Linux host does not have the
   module.
+- **The one-layer check does not pin letter case.** Two edits whose dataset names differ only
+  in case, and which resolve to one layer, are not refused by that check. Removing its
+  `.upper()` leaves the self-test green. No assertion pins it.
+- **`--await-drain` trusts the first reading as fresh.** Later reads count only if the versions
+  export's `exported_at` advances. The replicas export's `exported_at` is never checked. If
+  `versions.csv` is refreshed and `replicas.csv` stays stale, the stale file still shows the
+  item, so the id stays NOT_UNREGISTERED. That is the safe direction. Refresh both files.
+- **An empty replicas export is trusted as written.** Check that the replicas SELECT ran against
+  the right database before you act on DRAINED. A header-only file has no row to carry
+  `row_count`, so a cut export cannot be caught.
+- **A CSV in UTF-16**, which `sqlcmd` can write by default, fails the UTF-8 read and exits 2 with
+  the codec message. Write the export as UTF-8.
+- **An `--apply` run with no planned edit still writes the `--report` file.** Its closing line
+  says "nothing was written", which means no edit.
+- **The report is plain text, not CSV.** Do not paste it into a spreadsheet as cells. A replica
+  name that starts with `=`, `+`, `-` or `@` is not neutralised.
+- **Extremely nested JSON or XML exits 2 with a bare exception name.**
 - **State locks are not visible.** A connected session's lock on an old state can hold compress
   too, and no export shows it.
 - **The XML parser is the standard library's.** A definition with a DTD or an entity is refused

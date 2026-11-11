@@ -32,11 +32,12 @@ so and does not exit 0. A replica log with no usable rows, a replica that holds 
 not sync, a replica with no known generation, a replica whose `TargetType` the tool does not
 recognise, a log too short to show how long a generation stood still, an anchor that a replica
 item the tool could not read may own, a version name that holds `SYNC_` and fits no anchor
-pattern, and an edit that could not be checked are all exit 1 or exit 2, not exit 0. Two cases
-stay exit 0 by design, and Limits names both: a client-type replica that holds anchors, and an
-anchor with no replica item when every item in the export was read. After `--apply`, exit 0 means the service accepted each
-edit and moved its row's edit date. It does not mean any replica moved: only a later export
-shows that.
+pattern, and an edit that could not be checked are all exit 1 or exit 2, not exit 0. Three
+cases stay exit 0 by design, and Limits names each. The first is a client-type replica that
+holds anchors. The second is an anchor with no replica item when every item in the export was
+read. The third is a run after `--apply`: exit 0 then means the service accepted each edit and
+moved its row's edit date. It does not mean any replica moved, because the export that the
+tool reads cannot show that. Only a later export shows it.
 
 ```
 replicakeep self-test: no database, no real service, no credentials
@@ -94,10 +95,12 @@ PASS  --exit-on never cannot turn an UNKNOWN into exit 0  <-- pinned defect
 ...
 PASS  the real clock: an export nobody refreshes ends at the timeout as UNKNOWN, exit 1  <-- pinned defect
 ...
-287 assertions, 0 failed
+PASS  a service error that echoes the token is printed without it  <-- pinned defect
+...
+291 assertions, 0 failed
 ```
 
-The block above is a real run, cut to 29 of its 287 PASS lines. Each line is verbatim, and
+The block above is a real run, cut to 30 of its 291 PASS lines. Each line is verbatim, and
 `...` marks the lines left out.
 
 The second half of the same trouble is the end of a replica that is abandoned. A replica that
@@ -150,8 +153,10 @@ exists.
 Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-party package.
 The tool reads files, and under `--apply` it calls a feature service over HTTP.
 
-The same 287 assertions pass on Windows (Python 3.13.2), on Windows (Python 3.9.25) and on
-Ubuntu 24.04 (Python 3.12.3). The output is identical on all three apart from line endings. The
+The same 291 assertions pass on Windows (Python 3.13.2) and on Ubuntu 24.04 (Python 3.12.3),
+and the output is identical apart from line endings. They also pass on Windows with Python
+3.11.8. No Python 3.9 was available for a run: the 3.9 floor is checked only by parsing the
+file with `feature_version=(3, 9)`. The
 self-test takes about 7 seconds on Windows, and about 1 second of those is real waits of the
 drain tests. Branch coverage of `replicakeep.py` is 100 percent with one
 pragma. See "Coverage".
@@ -286,8 +291,8 @@ FROM sde.gdb_replicalog;
 The SQL Server form of the same three SELECTs uses `CONVERT(varchar(19), ..., 120)` for dates,
 `CAST(items.Definition AS nvarchar(max))` for the XML and the `sde.` table names from Esri's
 system table pages. It was not run for this README, because no SQL Server was available. Do
-not save the replicas export with `sqlcmd -s ","`. That client does not quote a field, and a
-filter such as `KIND IN ('A','B')` holds a comma. Use a client that quotes, or export JSON.
+not save the replicas export with `sqlcmd -s ","`. In the runs of this author that client did not
+quote a field (see Limits), and a filter such as `KIND IN ('A','B')` holds a comma. Use a client that quotes, or export JSON.
 
 ## What it decides
 
@@ -576,8 +581,9 @@ behavior: widening `[^.\s]` to `[^\s]` in the owner prefix matches the same name
 default text of the helper that reads an error message is used only when an error is missing.
 The third is real: two edits whose dataset names differ only in case, on one layer, would be
 refused as different datasets, and no case in the self-test reaches it.
-An earlier sweep of 86 mutations against the first version of this tool left 29 survivors, and
-each of those now has an assertion that kills it. I did not rerun a sweep of the whole file on
+A first sweep of 86 mutations, against the first version of this tool, left 29 survivors, and
+each of those now has an assertion that kills it. It is a different sweep from the 332-mutant
+one named in Limits, which ran against a later version. I did not rerun a sweep of the whole file on
 this version, and the script is not in the repository.
 
 Every limit below that describes how the tool behaves for a given input was reproduced once on
@@ -589,7 +595,7 @@ the self-test.
 ```
 python -m coverage run --branch replicakeep.py --self-test
 python -m coverage report -m
-replicakeep.py 1392 0 356 0 100%
+replicakeep.py 1419 0 356 0 100%
 ```
 
 The file ends with `if __name__ == "__main__":  # pragma: no branch`. Coverage runs the file
@@ -611,10 +617,30 @@ arm is the only difference. No other line is excluded.
   that the self-test of that commit printed are still printed, with the same text, by the
   current one.
 - **Two Esri sources were read from archived copies, not live pages.** They are the technical
-  article and the 10.1 system tables page.
+  article and the 10.1 system tables page. The live support site refused a fetch on 2026-11-11
+  (HTTP 403), so the quotes from the technical article were not re-checked on that date.
 - **The mutation sweeps and the similar-tool search cannot be repeated from this repository.**
   The sweeps were run by scripts that are not here. The search for similar tools was last run
   on 2026-10-12, before `--await-drain` was added.
+- **The round 3 findings were not kept**, so the fixes were confirmed from the commit diff and
+  the 230 surviving assertions, not from the original list.
+- **The mutation counts of the earlier sweeps come from scripts that are not shipped** and cannot
+  be re-checked. Of the 13 drain mutations, 6 were re-run later and the self-test killed all 6.
+- **A real wait needs an external export loop**, which this repository does not ship. The
+  self-test refreshes the exports with a thread on the real clock.
+- **After `--apply`, exit 0 does not mean a replica moved.** The export the tool read cannot show
+  a later generation, so a replica repaired in this run stops being a finding on the word of the
+  service and the edit date alone. Export again after the next sync.
+- **During `--apply`, phase two goes on after one failure.** A failed re-read or write marks that
+  edit FAILED and the later edits are still written. The run then exits 2.
+- **`--accept-empty-replicas` is an assertion by the operator** that the replicas export was
+  whole. With it, a replica whose `SYNC_` versions are also gone reads DRAINED.
+- **A field name returned by the service is printed as received**, so a hostile service could
+  forge report lines. The service you name is trusted.
+- **Check the hosts in your targets file before `--apply`.** The token is sent to every https
+  host named there.
+- **Name a new file for `--report`.** An existing file at that path is overwritten without a
+  prompt, even one of the input exports.
 - **The drain example was run once as a separate process.** The self-test uses a thread for the
   same check.
 - **`exported_at` has a resolution of one second.** Two exports taken in the same second add no
@@ -715,14 +741,13 @@ arm is the only difference. No other line is excluded.
 - **The header is `X-Esri-Authorization`.** Esri documents it, and says header tokens are
   supported from ArcGIS Server 10.5.1. The tool sends no other header. A service that accepts
   only the standard `Authorization` header will refuse every request.
-- **The tool uses the proxy settings of the environment.** With `HTTP_PROXY` set, a request to
-  `http://127.0.0.1` goes to the proxy, and the `--self-test` runs of `--apply` fail. Set
-  `no_proxy` for `127.0.0.1`, or unset `HTTP_PROXY`, before the self-test or a local target.
-- **A connection that ends in the middle of a response is not caught.**
-  `http.client.IncompleteRead` and `BadStatusLine` escape the request function. The run exits 2
-  with a bare exception name. Under `--apply`, edits that were already sent are not written to
-  the `--report` file, which is left empty. A raw socket that answers `GARBAGE NOT HTTP` showed
-  it.
+- **A request to this machine ignores the proxy settings of the environment.** A request to
+  an https host still uses `HTTPS_PROXY` and `NO_PROXY`, so the token goes to that proxy. A
+  loopback http target is sent direct, and the self-test pins that with `HTTP_PROXY` set.
+- **A connection that ends in the middle of a response, or a reply that is not HTTP,** raises
+  an `http.client` error. The request function turns it into a failed request: phase one
+  stops before any write, and in phase two that one edit reads FAILED. Under `--apply` the
+  report records every edit that was sent. The error text is the exception's own.
 - **`--report` overwrites its file.** It is opened for writing before the first edit, so a file
   of that name is truncated, even when the run then refuses. Do not point it at an export or
   the targets file. The tool does not check.
@@ -773,13 +798,12 @@ arm is the only difference. No other line is excluded.
 - **A token is optional under `--apply`.** With `REPLICAKEEP_TOKEN` unset or empty, every request
   goes out without the header. A secured service then refuses the first read and the run exits 2
   in phase one. A service that accepts anonymous edits would be edited without a credential.
-- **A service that puts the token in its own error text would print it.** The tool shows the
-  service's error message on stderr and in the `--report` file. Esri's services answer
-  "Invalid token." and do not echo it.
+- **A service that echoes the token in its error text gets it replaced with `***`.** The tool
+  replaces the exact token in the service's error code and message before it prints either.
+  A token that the gateway changes first, for example by encoding it, would not match. Esri's
+  services answer "Invalid token." and do not echo it.
 - **The 30-second request timeout applies to each socket read**, not to a whole response. A
   target that sends data slowly can hold the run for a long time.
-- **With a proxy set, a plain http loopback target goes to the proxy, and the token header
-  goes with it.**
 - **`--only` leaves the other replicas out of the exit decision as well as the plan.** A replica
   that `--only` does not name cannot make the run exit 1, even if it holds the compress floor.
 - **`--before-replicas` cannot prove that a `Sync Replica` id was registered.** That reading
@@ -797,7 +821,7 @@ arm is the only difference. No other line is excluded.
 - **The self-test writes temporary files and binds a local HTTP stub.** It writes nothing in
   the repository and makes no request to any other host. The tool itself writes only under
   `--apply`.
-- **A mutation sweep of an earlier version left 24 of 332 mutants alive.** About 14 were
+- **A mutation sweep of a later version than the 86-mutation one left 24 of 332 mutants alive.** About 14 were
   settings such as the default limits and the timeout. Three were real gaps: the filter printed
   in the plan, the "edit N of M" numbering, and the generation shown in the detail line. The
   self-test now asserts those three and pins the defaults. I did not rerun the whole sweep on
@@ -848,8 +872,12 @@ arm is the only difference. No other line is excluded.
 - **An accepted empty replicas export is trusted as written.** With `--accept-empty-replicas`,
   check that the replicas SELECT ran against the right database before you act on DRAINED. A
   header-only file has no row to carry `row_count`, so a cut export cannot be caught.
-- **A CSV in UTF-16**, which `sqlcmd` can write by default, fails the UTF-8 read and exits 2 with
-  the codec message. Write the export as UTF-8.
+- **A CSV in UTF-16** fails the UTF-8 read and exits 2 with the codec message. Without `-u`,
+  `sqlcmd` writes its output file in the current code page. With `-u` it writes Unicode.
+  Windows PowerShell 5.1 redirection (`>`) also writes UTF-16 (observed, not cited). Write the
+  export as UTF-8.
+- **That `sqlcmd` does not quote fields is observed, not documented.** The Microsoft sqlcmd page
+  documents `-s col_separator` and says nothing of quoting.
 - **An `--apply` run with no planned edit still writes the `--report` file.** Its closing line
   says "nothing was written", which means no edit.
 - **The report is plain text, not CSV.** Do not paste it into a spreadsheet as cells. A replica
@@ -908,6 +936,10 @@ arm is the only difference. No other line is excluded.
   authentication", and says that with ArcGIS Server "header tokens are supported starting from
   version 10.5.1". It also says a header keeps intermediaries from reading the token, which a
   query parameter does not.
+- [sqlcmd utility](https://learn.microsoft.com/en-us/sql/tools/sqlcmd/sqlcmd-utility),
+  fetched on 2026-11-11: "If you don't specify a code page, sqlcmd uses the current code page
+  for both input and output files." With `-u`, "sqlcmd stores the output_file in Unicode
+  format". `-s col_separator` is documented, and the page says nothing of quoting a field.
 - [Enable Editor Tracking](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/enable-editor-tracking.html):
   the last editor and last edit date fields.
 - [Feature object](https://developers.arcgis.com/rest/services-reference/enterprise/feature-object/):

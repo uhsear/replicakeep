@@ -57,6 +57,7 @@ import argparse
 import contextlib
 import csv
 import datetime
+import http.client
 import io
 import json
 import math
@@ -781,6 +782,10 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 OPENER = urllib.request.build_opener(NoRedirect)
+# An environment proxy must not receive a request meant for this machine, and
+# the token header with it.
+LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                           NoRedirect)
 
 
 def call(url, params, token, post=True):
@@ -793,10 +798,12 @@ def call(url, params, token, post=True):
         req = urllib.request.Request(url + "?" + body)
     if token:
         req.add_header("X-Esri-Authorization", "Bearer " + token)
+    opener = LOCAL_OPENER if (
+        urllib.parse.urlsplit(url).hostname in LOOPBACK) else OPENER
     try:
-        with OPENER.open(req, timeout=REQUEST_TIMEOUT) as resp:
+        with opener.open(req, timeout=REQUEST_TIMEOUT) as resp:
             raw = resp.read(MAX_RESPONSE_BYTES + 1)
-    except (urllib.error.URLError, OSError) as exc:
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
         raise ApplyError("the request failed: %s" % clean(exc)[:200])
     if len(raw) > MAX_RESPONSE_BYTES:
         raise ApplyError("the response is larger than %d bytes."
@@ -809,9 +816,12 @@ def call(url, params, token, post=True):
         raise ApplyError("the response is not a JSON object.")
     if "error" in data:
         err = data["error"] if isinstance(data["error"], dict) else {}
+        # A gateway can echo the request header in its error body.
+        def hide(value):
+            return clean(value).replace(token, "***") if token else clean(value)
         raise ApplyError("the service returned an error: code %s, %s"
-                         % (clean(err.get("code")),
-                            clean(err.get("message"))[:200]))
+                         % (hide(err.get("code")),
+                            hide(err.get("message"))[:200]))
     return data
 
 
@@ -2319,6 +2329,40 @@ def self_test():
         check(code == 2 and "code 498" in text and not writes(stub),
               "the service's own error code is reported")
 
+        # A gateway that quotes the request header in its error body must
+        # not carry the token into the output or the report.
+        stub = setup()
+        stub.layer("roads")["raw"]["applyEdits"] = (
+            200, ('{"error": {"code": 400, "message": "bad request, header '
+                  'was Bearer %s"}}' % secret).encode("ascii"), [])
+        code, out, err, text = go(stub)
+        check(code == 2 and "FAILED the service returned an error: code 400"
+              in text and "Bearer ***" in text
+              and secret not in out + err + text,
+              "a service error that echoes the token is printed without it  "
+              "<-- pinned defect")
+        stub = setup()
+        stub.layer("roads")["raw"]["0"] = (
+            200, b'{"error": {"code": 498, "message": "Invalid"}}', [])
+        code, out, err, text = go(stub, env=None)
+        check(code == 2 and "code 498, Invalid" in text,
+              "a service error is reported when no token was sent")
+
+        stub = setup()
+        real_local = LOCAL_OPENER.open
+
+        def garbage(*args, **kwargs):
+            raise http.client.BadStatusLine("not http")
+        LOCAL_OPENER.open = garbage
+        try:
+            code, out, err, text = go(stub)
+        finally:
+            LOCAL_OPENER.open = real_local
+        check(code == 2 and "the request failed" in text
+              and "refused before any edit" in text,
+              "a reply that is not HTTP is an ApplyError, and the report "
+              "is written  <-- pinned defect")
+
         for label, body in (
                 ("success false", {"updateResults": [{"success": False}]}),
                 ("an empty updateResults", {"updateResults": []}),
@@ -2863,6 +2907,18 @@ def self_test():
                       for r in stub.requests),
               "the real command line reads the token from the environment, "
               "edits, and prints no token")
+        stub = setup()
+        env.update(HTTP_PROXY="http://127.0.0.1:9",
+                   http_proxy="http://127.0.0.1:9")
+        done = subprocess.run(
+            [sys.executable, script] + apply_args(), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stub.close()
+        check(done.returncode == 0 and len(writes(stub)) == 3
+              and all(r["token"] == "Bearer " + secret
+                      for r in stub.requests),
+              "a request to this machine ignores HTTP_PROXY, so the token "
+              "never goes to a proxy  <-- pinned defect")
         listing = sorted(os.listdir(tmp))
         done = subprocess.run([sys.executable, script] + argv + ["--ap"],
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)

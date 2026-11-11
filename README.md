@@ -216,7 +216,7 @@ for seven prefixes: `--ap`, `--repor`, `--replica-l`, `--exit`, `--vers`, `--min
 |---|---|
 | 0 | No finding at the `--exit-on` level. After a successful `--apply`, the replicas that were edited are not findings. |
 | 1 | At least one finding. By default (`--exit-on idle`) a finding is an idle replica that the run did not repair, or a replica that holds anchors and that the tool could not judge or no edit can move: `NOT_SYNCING`, `NO_ACK`, `NO_DATASET`, `NO_TYPE` or `SHORT_LOG`. An `--apply` edit that the tool could not check leaves its replicas idle, so it is a finding too. So is an anchor with no replica item while another item could not be read, because that item may own it, and so is a version name that holds `SYNC_` and matches no anchor pattern. `--exit-on any` also counts an anchor with no replica item when every item was read. |
-| 2 | The tool could not do its job: an export could not be read, an export is empty or disagrees with itself, a flag or the token was wrong, a URL was refused, a read failed, or an edit was refused or could not be checked. Three more cases are exit 2: a replica log with no row for any server-type replica that holds anchors, anchors while no item in the replicas export is a usable `GPReplica`, and an `--only` id that no replica item carries. |
+| 2 | The tool could not do its job: an export could not be read, an export is empty or disagrees with itself, a flag or the token was wrong, a URL was refused, a read failed, or an edit was refused (`FAILED`, which includes a failed read-back after the request). An edit that was accepted but could not be checked (`UNVERIFIED`) is exit 1, not exit 2. Three more cases are exit 2: a replica log with no row for any server-type replica that holds anchors, anchors while no item in the replicas export is a usable `GPReplica`, and an `--only` id that no replica item carries. |
 
 Exit 2 is kept apart from exit 1 on purpose. A scheduler that cannot tell "the tool failed"
 from "findings exist" will show a failure every day, or will hide one. These are the same codes
@@ -759,6 +759,23 @@ arm is the only difference. No other line is excluded.
   target that sends data slowly can hold the run for a long time.
 - **With a proxy set, a plain http loopback target goes to the proxy, and the token header
   goes with it.**
+- **`--only` leaves the other replicas out of the exit decision as well as the plan.** A replica
+  that `--only` does not name cannot make the run exit 1, even if it holds the compress floor.
+- **`--before-replicas` cannot prove that a `Sync Replica` id was registered.** That reading
+  takes the ID only from `GPReplica` items. A `Sync Replica` id is `UNSEEN`, which is exit 1,
+  the safe direction.
+- **The PostgreSQL query for the replica log does not coalesce NULLs.** A NULL `targetgen`,
+  `errorcode`, `event` or `logdate` in any row exits 2 (see the blank-cell limit above). Filter
+  the rows in the query if your log has them.
+- **A field name that the service returns is printed as received in the `APPLIED` line**, on
+  stdout and in the `--report` file. A hostile service could put a terminal escape sequence in
+  it. Point `--targets` only at a service that you trust.
+- **The replicas export has no timestamp.** Only the versions export's `exported_at` is checked
+  for freshness. A stale replicas export can add evidence that a replica is not drained, but
+  it cannot add evidence that one is, except for the header-only case above.
+- **The self-test writes temporary files and binds a local HTTP stub.** It writes nothing in
+  the repository and makes no request to any other host. The tool itself writes only under
+  `--apply`.
 - **A mutation sweep of an earlier version left 24 of 332 mutants alive.** About 14 were
   settings such as the default limits and the timeout. Three were real gaps: the filter printed
   in the plan, the "edit N of M" numbering, and the generation shown in the detail line. The

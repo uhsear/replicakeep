@@ -555,7 +555,7 @@ plan again. A replica whose generation moved is `ACTIVE` in that second plan.
 | A read that fails after the first is survived, a failed first read exits 2 | Self-test: a scripted `InputError` and `OSError`, and a missing file through the command line. |
 | An empty versions export is refused, an empty replicas export is a reading | Self-test, through `drain_reading`. |
 | `--exit-on`, `--apply`, `--report` and the plan flags are refused with `--await-drain` | Self-test, through the command line. |
-| A poll or timeout of 0, a negative value, `nan` or `inf` is refused | Self-test, through the command line. |
+| A poll of 0 or less, a timeout below 0, `nan` or `inf` is refused | Self-test, through the command line. |
 | The idle-replica plan still gives the same verdicts after `build` was split into helpers | Self-test: all 230 earlier assertions are unchanged. |
 
 I ran 13 one-line mutations of the drain code with a script: the freshness test on `exported_at`, the proof test, the blind test, the timeout test, the cut of the last sleep, the exit rule, the item test, the anchor test, the survival of a failed read, the proved set, the two flag bounds and the `--before-replicas` read. The self-test killed all 13. Three were killed by a hang and not by a failed assertion: a timeout test of `left < 0` and the two widened flag bounds make a run on the real clock go on for 1,800 seconds or more, and I stopped each at 60 seconds. The script is not in the repository.

@@ -59,13 +59,14 @@ PASS  a log that covers 3 days with one generation does not say the replica move
 ...
 PASS  a NO_TYPE replica is a finding by default, never a clean exit  <-- pinned defect
 ...
+PASS  a filter element under another name is never read as no filter: no edit, a finding  <-- pinned defect
+...
 PASS  the abbreviation --ap is refused by the parser  <-- pinned defect
 ...
 PASS  a repaired run is still exit 1 while replicas that cannot be judged remain  <-- pinned defect
 PASS  a token with '\r\n' after it is trimmed, not rejected  <-- pinned defect
 ...
 PASS  a token with a space, a control or a non-ASCII character is refused before the report is opened, and its text is never echoed  <-- pinned defect
-...
 PASS  a layer with no editor tracking is edited, says it cannot be checked, and leaves its replicas findings (exit 1, not 0)  <-- pinned defect
 PASS  a third edit of a row that two edits already stamped is checked against the stamp just before its own write  <-- pinned defect
 ...
@@ -75,6 +76,7 @@ PASS  a redirect is refused, so the token is never resent to its target  <-- pin
 ...
 PASS  a plan-only run never prints a target URL that holds a query string or login  <-- pinned defect
 ...
+PASS  a Sync Replica item with no usable ID cannot own a gone replica id, so it never blocks DRAINED  <-- pinned defect
 ...
 PASS  an empty versions export is refused, never read as every replica drained  <-- pinned defect
 ...
@@ -92,10 +94,10 @@ PASS  --exit-on never cannot turn an UNKNOWN into exit 0  <-- pinned defect
 ...
 PASS  the real clock: an export nobody refreshes ends at the timeout as UNKNOWN, exit 1  <-- pinned defect
 ...
-273 assertions, 0 failed
+280 assertions, 0 failed
 ```
 
-The block above is a real run, cut to 27 of its 273 PASS lines. Each line is verbatim, and
+The block above is a real run, cut to 29 of its 280 PASS lines. Each line is verbatim, and
 `...` marks the lines left out.
 
 The second half of the same trouble is the end of a replica that is abandoned. A replica that
@@ -148,7 +150,7 @@ exists.
 Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-party package.
 The tool reads files, and under `--apply` it calls a feature service over HTTP.
 
-The same 273 assertions pass on Windows (Python 3.13.2), on Windows (Python 3.9.25) and on
+The same 280 assertions pass on Windows (Python 3.13.2), on Windows (Python 3.9.25) and on
 Ubuntu 24.04 (Python 3.12.3). The output is identical on all three apart from line endings. The
 self-test takes about 7 seconds on Windows, and about 1 second of those is real waits of the
 drain tests. Branch coverage of `replicakeep.py` is 100 percent with one
@@ -172,6 +174,9 @@ python replicakeep.py ... --min-idle-days 14 --silent-days 3 --only 101,103
 python replicakeep.py ... --targets targets.csv --report plan.txt --apply
 python replicakeep.py --await-drain 56,57 --versions versions.csv --replicas replicas.csv
 ```
+
+`--await-drain` only re-reads the two export files. Something else must rewrite them on a
+schedule, or the wait ends UNKNOWN at its limit.
 
 The token for `--apply` comes from the `REPLICAKEEP_TOKEN` environment variable. There is no
 flag for it, so it cannot land in a shell history or a process list. The tool sends it in the
@@ -211,7 +216,7 @@ for seven prefixes: `--ap`, `--repor`, `--replica-l`, `--exit`, `--vers`, `--min
 |---|---|
 | 0 | No finding at the `--exit-on` level. After a successful `--apply`, the replicas that were edited are not findings. |
 | 1 | At least one finding. By default (`--exit-on idle`) a finding is an idle replica that the run did not repair, or a replica that holds anchors and that the tool could not judge or no edit can move: `NOT_SYNCING`, `NO_ACK`, `NO_DATASET`, `NO_TYPE` or `SHORT_LOG`. An `--apply` edit that the tool could not check leaves its replicas idle, so it is a finding too. So is an anchor with no replica item while another item could not be read, because that item may own it, and so is a version name that holds `SYNC_` and matches no anchor pattern. `--exit-on any` also counts an anchor with no replica item when every item was read. |
-| 2 | The tool could not do its job: an export could not be read, an export is empty or disagrees with itself, a flag or the token was wrong, a URL was refused, a read failed, or an edit was refused or could not be checked. Three more cases are exit 2: a replica log with no row for any replica that holds anchors, anchors while no item in the replicas export is a usable `GPReplica`, and an `--only` id that no replica item carries. |
+| 2 | The tool could not do its job: an export could not be read, an export is empty or disagrees with itself, a flag or the token was wrong, a URL was refused, a read failed, or an edit was refused or could not be checked. Three more cases are exit 2: a replica log with no row for any server-type replica that holds anchors, anchors while no item in the replicas export is a usable `GPReplica`, and an `--only` id that no replica item carries. |
 
 Exit 2 is kept apart from exit 1 on purpose. A scheduler that cannot tell "the tool failed"
 from "findings exist" will show a failure every day, or will hide one. These are the same codes
@@ -245,7 +250,7 @@ anchors. That covers an empty or truncated log, and a log that joins to no repli
 | Export | Columns | Notes |
 |---|---|---|
 | `versions` | `name`, `exported_at`, `row_count` | The export that compressfloor `--sql` prints works as it is. Other columns are ignored. |
-| `replicas` | `objectid`, `item_type`, `definition`, `row_count` | `definition` is the item's XML text. A `Sync Replica` item and an item with no usable ID are counted and left out. |
+| `replicas` | `objectid`, `item_type`, `definition`, `row_count` | `definition` is the item's XML text. A `Sync Replica` item and an item with no usable ID are counted and left out. In `--await-drain` a `Sync Replica` item is read for its ID instead: a usable ID counts as a replica item, and an item with none is not counted as unread. |
 | `replica_log` | `replicaid`, `logdate`, `event`, `errorcode`, `targetgen`, `row_count` | Esri says `replicaid` corresponds to `objectid` in `GDB_ITEMS`, not to the ID inside the XML. The tool joins on `objectid`. Export the whole table. |
 | `targets` | `dataset`, `layer_url` | Written by hand. A dataset may be named in full or by its trailing parts, so `OWNER.TABLE` and `TABLE` both match `DB.OWNER.TABLE`. A dataset that matches two rows matches none. |
 
@@ -386,7 +391,7 @@ read exits 2.
 | `NOT_UNREGISTERED` | The replica item is still in the replicas export. The unregister has not run, or has not taken effect. | No |
 | `ANCHORS_REMAIN` | The item is gone, and at least one `SYNC_` version of the id is still in the versions export. | No |
 | `UNSEEN` | Nothing of the id is in the exports, and nothing showed it registered. A mistyped id reads the same as a drained one. Pass `--before-replicas`. | No |
-| `BLIND` | Nothing of the id is in the exports, but a version name that holds `SYNC_` and fits no anchor pattern, or a replica item that could not be read, may own it. | No |
+| `BLIND` | Nothing of the id is in the exports, but a version name that holds `SYNC_` and fits no anchor pattern, or a replica item that could not be read, may own it. A `GPSyncReplica` item is not such an item: it is read for its ID, and one with no usable ID owns nothing. | No |
 
 The verdict is `DRAINED` only when every id is DRAINED. In every other case it is `UNKNOWN`, and
 the exit code is 1. The tool does not call a timeout a failure of the geodatabase or a success
@@ -532,7 +537,9 @@ plan again. A replica whose generation moved is `ACTIVE` in that second plan.
 | Two datasets that resolve to one layer stop the run before any request | Self-test, against the stub: a targets file whose two rows name one layer URL exits 2 with no request recorded, and the report says the run was refused. |
 | An anchor that an unread item may own is a finding | Self-test: `gate` with and without an unread item, and `describe` on the fixture that has two. |
 | An owner-qualified anchor name is an anchor, and an odd `SYNC_` name is a finding | Self-test: `build` on the fixture plus five added version names, then `analyse`, `describe` and `gate`. |
-| A newline in a replica filter cannot forge a report line | Self-test: `describe` on an edit whose filter holds a newline. |
+| A newline in a replica filter cannot forge a report line | Self-test: `describe` on an edit whose filter holds a newline. The filter goes through the same escaping as a name. |
+| A filter element under another name plans no edit | Self-test: `analyse` on a replica whose `DefQuery` is renamed `DefinitionQuery`: no edit, `NO_DATASET`, exit 1. |
+| A Sync Replica item does not block DRAINED | Self-test: `drain_reading` and `drain_verdicts` on Sync Replica items with no ID, a bad ID and the ID of the replica. |
 | A zero-edit `--apply` run does not claim an edit was made | Self-test: `--only 109` with `--apply`, no request reaches the stub. |
 | The JSON form of a targets file works | Self-test: a plan-only run with a JSON targets file. |
 | The PostgreSQL queries produce the exports | A run on 2026-10-12 against PostgreSQL 16.15 with `psql --csv`, compared with the fixture's own plan. |
@@ -571,7 +578,7 @@ the self-test.
 ```
 python -m coverage run --branch replicakeep.py --self-test
 python -m coverage report -m
-replicakeep.py 1338 0 340 0 100%
+replicakeep.py 1376 0 354 0 100%
 ```
 
 The file ends with `if __name__ == "__main__":  # pragma: no branch`. Coverage runs the file
@@ -585,6 +592,30 @@ arm is the only difference. No other line is excluded.
   documents only that the tool does not delete the replica's version. `--await-drain` does not
   assume a drain. At its limit it says UNKNOWN. It cannot tell a slow drain from versions that
   stay for good.
+- **Findings of review round 3 (commit bfc9d86).** The list of findings is not kept in the
+  repository, so this README cannot prove that each one is fixed. All 230 assertions that the
+  self-test of that commit printed are still printed, with the same text, by the current one.
+- **Two Esri sources were read from archived copies, not live pages.** They are the technical
+  article and the 10.1 system tables page.
+- **The mutation sweeps and the similar-tool search cannot be repeated from this repository.**
+  The sweeps were run by scripts that are not here. The search for similar tools was last run
+  on 2026-10-12, before `--await-drain` was added.
+- **The drain example was run once as a separate process.** The self-test uses a thread for the
+  same check.
+- **`exported_at` has a resolution of one second.** Two exports taken in the same second add no
+  evidence. Poll no faster than that.
+- **A drain read that fails on every poll after the first good one ends as UNKNOWN, exit 1.**
+  The last failed read is named in the report. It is not exit 2.
+- **The tool trusts that the versions export lists every version.** It refuses only an empty
+  or `row_count`-mismatched file. An export made by an account that cannot see other users'
+  private versions would show no `SYNC_` versions, so `--await-drain` could report DRAINED for
+  replicas whose versions remain.
+- **Any replica item that is not a `GPReplica` or a `GPSyncReplica` makes a gone id BLIND.**
+  An estate that holds such an item never reaches DRAINED. It stays safe, exit 1, but may be
+  unusable there.
+- **Field names that the service returns are printed as received.**
+- **A drain run exits 1 for a mistyped id (UNSEEN) and for a timeout (UNKNOWN) alike.** A
+  script must read the output to tell them apart.
 - **`--await-drain` cannot refresh an export.** It reads two files. If nothing rewrites them,
   it reads one fresh export, waits, and ends UNKNOWN. The report counts the reads it ignored.
 - **A replicas export that is empty because it failed reads as no items.** A zero-byte file is
@@ -643,8 +674,9 @@ arm is the only difference. No other line is excluded.
   IDs. On a larger layer the row is the lowest one returned, which still satisfies the filter.
 - **A `where` clause is the replica's filter, sent as written.** It must use field names that
   the service exposes. A filter that the service cannot parse fails in phase one. The filter
-  text is not escaped for display, so a newline in a filter is printed as it is, and it can
-  forge a `VERDICT` line in the plan and the report. Names are escaped. Filters are not.
+  text goes through the same escaping as a name, so a newline in a filter shows as `
+` and
+  cannot forge a `VERDICT` line in the plan or the report.
 - **A multi-dataset replica gets one edit, on its first dataset only.** If that dataset has no
   `--targets` row, the run exits 2, even when a later dataset of the replica has one.
 - **A dataset name in a definition must match a target by whole name parts.** If the definition
@@ -695,7 +727,7 @@ arm is the only difference. No other line is excluded.
   that is not an anchor but holds `SYNC_` in its name, such as `MY_SYNC_TEST`, causes the same
   exit 1. `--exit-on never` keeps exit 0.
 - **An anchor whose replica item exists but cannot be read is reported as an anchor without a
-  replica item.** Examples are a root with a default namespace, a `GPSyncReplica` root and an ID
+  replica item.** Examples are a root with a default namespace, a `GPSyncReplica` root (`--await-drain` reads that one for its ID) and an ID
   of -1. The report cannot tell it from an anchor with no item. It says how many items could
   not be read, and the run exits 1. When every item was read, an anchor with no replica item
   exits 0 unless you give `--exit-on any`.
@@ -752,8 +784,10 @@ arm is the only difference. No other line is excluded.
 - **A repeated `--apply` edits the same row again.** The plan does not remember an earlier
   edit, so a scheduled run repeats it on each run until the replica's next sync moves its
   generation.
-- **A `DefQuery` element that the tool does not recognise is read as no filter.** The edited
-  row may then lie outside the replica's scope, and the edit does not move that replica.
+- **A filter under an unknown name is caught only when the name looks like one.** A dataset with
+  no `DefQuery` element and a child whose name holds `query`, `filter`, `where` or `expression`
+  is not edited. The replica is `NO_DATASET`, exit 1. A dataset with no such child is read as
+  unfiltered, and the edit may then lie outside the replica's scope.
 - **A log keyed by replica ID instead of item objectid is caught only when nothing overlaps.**
   With partial overlap the verdicts are silently wrong. Use the item objectid, as stated above.
 - **If the report file cannot be written after the edits, the run exits 2 with no record of

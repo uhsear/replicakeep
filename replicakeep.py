@@ -104,6 +104,7 @@ TOKEN_ENV = "REPLICAKEEP_TOKEN"
 SERVER_TYPE = "esriReplicaTargetTypeServer"
 CLIENT_TYPE = "esriReplicaTargetTypeClient"
 DATASET_TYPES = ("esriDTFeatureClass", "esriDTTable")
+FILTER_LIKE = re.compile(r"query|filter|where|expression", re.I)
 # Field types that are never rewritten. A rewrite of these is not a no-op.
 SKIP_FIELD_TYPES = ("esriFieldTypeOID", "esriFieldTypeGeometry",
                     "esriFieldTypeGlobalID", "esriFieldTypeGUID",
@@ -257,14 +258,37 @@ def parse_definition(xml):
     rid = int(text) if re.match(r"^[0-9]+$", text) else -1
     if rid < 0:
         return None
-    datasets = []
+    datasets, unfiltered = [], 0
     for el in root.iter("GPReplicaDataset"):
         name = clean(el.findtext("DatasetName"))
-        if el.findtext("DatasetType") in DATASET_TYPES and name:
-            datasets.append((name, (el.findtext("DefQuery") or "").strip()))
+        if el.findtext("DatasetType") not in DATASET_TYPES or not name:
+            continue
+        if el.find("DefQuery") is None and any(
+                FILTER_LIKE.search(c.tag) for c in el):
+            # A filter under another name reads as no filter, and an edit on
+            # the lowest row of the whole layer lands outside the replica.
+            unfiltered += 1
+            continue
+        datasets.append((name, (el.findtext("DefQuery") or "").strip()))
     return {"id": rid, "name": clean(root.findtext("Name")) or "(unnamed)",
             "target_type": (root.findtext("TargetType") or "").strip(),
-            "datasets": datasets}
+            "datasets": datasets, "unfiltered": unfiltered}
+
+
+def sync_item_id(xml):
+    """The ID of a GPSyncReplica root: its number, or -1 for none.
+
+    None when the item is blank or any other root. A Sync Replica item is
+    not a GPReplica and holds no SYNC_ anchors of a server replica, but its
+    ID, when it has one, may still name a replica.
+    """
+    if not xml.strip():
+        return None
+    root = ET.fromstring(xml)
+    if root.tag != "GPSyncReplica":
+        return None
+    text = (root.findtext("ID") or "").strip()
+    return int(text) if re.match(r"^[0-9]+$", text) else -1
 
 
 def read_clock(versions):
@@ -293,8 +317,12 @@ def collect_anchors(versions):
     return anchors, odd
 
 
-def read_items(replicas):
-    """The usable replica items, and the count of items that were not."""
+def read_items(replicas, sync_ids=None):
+    """The usable replica items, and the count of items that were not.
+
+    When sync_ids is a set, a GPSyncReplica item is read for its ID instead
+    of counted as unread, and a usable ID goes into the set.
+    """
     reps, unread, objectids = [], 0, set()
     for i, r in enumerate(replicas):
         objectid = cell(r, "objectid", "replicas", i, to_int)
@@ -302,7 +330,13 @@ def read_items(replicas):
         if objectid in objectids:
             raise InputError("the replicas export has one objectid twice.")
         objectids.add(objectid)
-        if parsed is None:
+        sid = None
+        if parsed is None and sync_ids is not None:
+            sid = sync_item_id(str(r.get("definition") or ""))
+        if sid is not None:
+            if sid >= 0:
+                sync_ids.add(sid)
+        elif parsed is None:
             unread += 1
         else:
             parsed["objectid"] = objectid
@@ -441,6 +475,10 @@ def analyse(model, min_idle_days=DEFAULT_MIN_IDLE_DAYS,
                 v["detail"] = ("generation %d unchanged for %s day(s), but "
                                "the definition lists no feature class or "
                                "table to edit" % (gen, span))
+                if rep["unfiltered"]:
+                    v["detail"] += (", and %d dataset(s) hold a filter "
+                                    "element under a name the tool does not "
+                                    "know" % rep["unfiltered"])
             else:
                 v["detail"] = ("generation %d unchanged for %s day(s); "
                                "holds %d anchor version(s)"
@@ -593,9 +631,11 @@ def drain_reading(versions, replicas):
                          "leaves an empty file, and read as no versions it "
                          "would call every replica drained.")
     anchors, odd = collect_anchors(versions)
-    items, unread = read_items(replicas)
+    syncs = set()
+    items, unread = read_items(replicas, syncs)
     return {"at": read_clock(versions), "anchors": anchors,
-            "items": set(r["id"] for r in items), "blind": odd + unread}
+            "items": set(r["id"] for r in items) | syncs,
+            "blind": odd + unread}
 
 
 def drain_verdicts(ids, reading, proved):
@@ -1855,6 +1895,35 @@ def self_test():
           "pattern" in otext[-1],
           "an owner-qualified anchor name is an anchor, and a SYNC_ name that "
           "fits no pattern is counted and reported  <-- pinned defect")
+    fm = build(versions=[{"name": n, "owner": "SDE", "state_id": 1,
+                          "exported_at": ago(0), "row_count": 0}
+                         for n in ("DEFAULT", "SYNC_SEND_201_1")],
+               replicas=[{"objectid": 9401, "item_type": "Replica",
+                          "definition": definition(
+                              201, "renamed", SERVER_TYPE,
+                              [(PLANTS, FEATURE, "(KIND='A')")]).replace(
+                              "DefQuery", "DefinitionQuery")},
+                         {"objectid": 9402, "item_type": "Replica",
+                          "definition": definition(
+                              202, "bare", SERVER_TYPE,
+                              [(PLANTS, FEATURE, "")]).replace(
+                              "<DefQuery></DefQuery>", "")}],
+               replica_log=[{"replicaid": 9401, "logdate": ago(d),
+                             "event": 1, "errorcode": 0, "targetgen": 4,
+                             "row_count": 0} for d in (100, 1)])
+    fm["anchors"][202] = ["SYNC_SEND_202_1"]
+    fm["log"][9402] = fm["log"][9401]
+    fr = analyse(fm)
+    fby = dict((v["id"], v) for v in fr["verdicts"])
+    check(fby[201]["status"] == NO_DATASET and fr["edits"][0]["replica"] == 202
+          and len(fr["edits"]) == 1 and "1 dataset(s) hold a filter element"
+          in fby[201]["detail"] and gate(fr, "idle") == 1,
+          "a filter element under another name is never read as no filter: "
+          "no edit, a finding  <-- pinned defect")
+    check(fby[202]["status"] == IDLE and fr["edits"][0]["query"] == "",
+          "a dataset with no filter element at all is an unfiltered dataset")
+    check("hold a filter element" not in fby[202]["detail"],
+          "the filter note appears only for a replica with an unread filter")
     qd = describe(dict(report, edits=[dict(report["edits"][0],
                                            query="a\nb")]), 6)
     check("filter a\\nb" in "\n".join(qd)
@@ -2438,9 +2507,36 @@ def self_test():
         dr_fx = fixture()
         dr = drain_reading(dr_fx["versions"], dr_fx["replicas"])
         check(dr["at"] == AS_OF and 101 in dr["items"] and -1 not in dr["items"]
-              and 101 in dr["anchors"] and dr["blind"] == 2,
+              and 101 in dr["anchors"] and dr["blind"] == 1,
               "a drain reading holds the export time, the replica items, the "
-              "anchors and the two items it could not read")
+              "anchors and the one item it could not read")
+        sy_rows = [{"objectid": 9301, "item_type": "Sync Replica",
+                    "definition": definition("-1", "s", root="GPSyncReplica")},
+                   {"objectid": 9302, "item_type": "Sync Replica",
+                    "definition": definition("x", "s", root="GPSyncReplica")},
+                   {"objectid": 9303, "item_type": "Sync Replica",
+                    "definition": definition(56, "s", root="GPSyncReplica")}]
+        sy = drain_reading(dr_fx["versions"], sy_rows[:2])
+        check(sy["blind"] == 0 and sy["items"] == set()
+              and drain_verdicts([56], sy, set([56]))[0][1] == DRAINED,
+              "a Sync Replica item with no usable ID cannot own a gone replica "
+              "id, so it never blocks DRAINED  <-- pinned defect")
+        sy = drain_reading(dr_fx["versions"], sy_rows)
+        check(sy["items"] == set([56]) and sy["blind"] == 0
+              and drain_verdicts([56], sy, set())[0][1] == NOT_UNREGISTERED,
+              "a Sync Replica item that carries the ID of a replica keeps "
+              "that replica NOT_UNREGISTERED")
+        check(sync_item_id("  ") is None and sync_item_id("<a/>") is None
+              and sync_item_id(definition(5, "n")) is None,
+              "a blank item, another root and a GPReplica root are not "
+              "Sync Replica items")
+        sy = drain_reading(dr_fx["versions"], [
+            {"objectid": 9304, "item_type": "Replica", "definition": "  "},
+            {"objectid": 9305, "item_type": "Replica",
+             "definition": definition(-1, "n")}])
+        check(sy["blind"] == 2,
+              "a blank item and a GPReplica item with no usable ID stay "
+              "BLIND in a drain reading")
         dr_odd = fixture()
         dr_odd["versions"].append({"name": "SYNC_BROKEN", "exported_at":
                                    ago(0), "row_count": 0})

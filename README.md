@@ -745,8 +745,11 @@ arm is the only difference. No other line is excluded.
   tokens are supported from ArcGIS Server 10.5.1, and does not tie that note to this header. The tool sends no other header. A service that accepts
   only the standard `Authorization` header will refuse every request.
 - **A request to this machine ignores the proxy settings of the environment.** A request to
-  an https host still uses `HTTPS_PROXY` and `NO_PROXY`, so the token goes to that proxy. A
-  loopback http target is sent direct, and the self-test pins that with `HTTP_PROXY` set.
+  an https host still uses `HTTPS_PROXY` and `NO_PROXY`. The proxy gets only a `CONNECT
+  host:443` line, and the token header travels inside the TLS tunnel (a run against a local
+  socket standing in for a proxy saw no token). The proxy sees the token only if it ends TLS
+  itself. A loopback http target is sent direct, and the self-test pins that with
+  `HTTP_PROXY` set.
 - **A connection that ends in the middle of a response, or a reply that is not HTTP,** raises
   an `http.client` error. The request function turns it into a failed request: phase one
   stops before any write, and in phase two that one edit reads FAILED. Under `--apply` the

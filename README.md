@@ -824,6 +824,15 @@ arm is the only difference. No other line is excluded.
 - **The replicas export has no timestamp.** Only the versions export's `exported_at` is checked
   for freshness. A stale replicas export can add evidence that a replica is not drained, but
   it cannot add evidence that one is.
+- **Abbreviations of the drain flags are refused by the parser but are not pinned in the self-test.** `--await 56` exits 2. Only the other abbreviations have an assertion.
+- **The token trim removes every leading and trailing Unicode white space character,** not only space, newline and carriage return.
+- **The token mask matches the exact token only.** A copy that `clean()` escaped or re-encoded in a service error is not masked. The reason phrase of an HTTP error status line, and a layer name, field name or capabilities text from the service, are printed as the server sent them, escaped for control characters but not masked.
+- **A targets row with a malformed bracket host,** such as `https://[bad/FeatureServer/0`, makes plan-only mode exit 2 with "Invalid IPv6 URL" and the line "This is a failure of the tool". No verdict is wrong. The self-test does not cover it.
+- **A malformed layer description from the service,** such as an editable field with no name, can end phase one with a bare exception name and an empty report file. No edit has been made at that point.
+- **An unforeseen internal error after the first write leaves the report file empty,** so the service holds the only record of the edits made. No realistic trigger was found.
+- **A later read in `--await-drain` that hits deeply nested JSON** ends the wait with exit 2, as the first read does. It is not noted and retried.
+- **Naming an input file as `--report` overwrites it** after the tool has read it. Give `--report` a new file name.
+- **The quoted self-test block is an excerpt, not a full run.** It leaves out lines, and the quoted lines are not all in the order the tool prints them.
 - **The self-test writes temporary files and binds a local HTTP stub.** It writes nothing in
   the repository and makes no request to any other host. The tool itself writes only under
   `--apply`.
